@@ -97,16 +97,21 @@ mod tests {
     use super::*;
     use crate::core::{Completeness, Visibility};
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
     use std::time::Duration;
 
     struct Agents {
         completed: Arc<AtomicUsize>,
+        calls: Mutex<std::collections::HashMap<String, usize>>,
     }
     impl Model for Agents {
         async fn complete(&self, prompt: &str) -> Result<String, ErrorCategory> {
+            let (_, data) = prompt.split_once('\n').unwrap();
+            let data: serde_json::Value = serde_json::from_str(data).unwrap();
+            let id = data["instructions"].as_str().unwrap();
+            *self.calls.lock().unwrap().entry(id.into()).or_default() += 1;
             if prompt.contains("failure") {
                 self.completed.fetch_add(1, Ordering::SeqCst);
                 return Err(ErrorCategory::RateLimited);
@@ -160,6 +165,7 @@ mod tests {
             Runtime::new(
                 Agents {
                     completed: completed.clone(),
+                    calls: Mutex::new(std::collections::HashMap::new()),
                 },
                 Duration::from_millis(100),
             ),
@@ -208,14 +214,13 @@ mod tests {
             ("invalid", ErrorCategory::InvalidResponse),
         ] {
             let (agents, critic, calls) = runtimes(2, response);
-            let report = review_223(
-                &agents,
-                &critic,
-                &document(Visibility::Public),
-                &checks(&["one", "failure"]),
-            )
-            .await
-            .unwrap();
+            let doc = Document {
+                markdown: "ёж passenger freight".into(),
+                visibility: Visibility::Public,
+            };
+            let report = review_223(&agents, &critic, &doc, &checks(&["one", "failure"]))
+                .await
+                .unwrap();
             let BranchReport::CriticFailed {
                 evidence,
                 error: actual,
@@ -224,11 +229,21 @@ mod tests {
                 panic!("expected failure")
             };
             assert_eq!(actual, error);
+            assert_eq!(evidence.completeness(), Completeness::Partial);
+            assert_eq!(evidence.outcomes.len(), 2);
+            assert_eq!(evidence.outcomes[0].check_id, "one");
             assert_eq!(evidence.outcomes[1].check_id, "failure");
             assert_eq!(evidence.outcomes[1].result, Err(ErrorCategory::RateLimited));
-            for citation in &evidence.outcomes[0].result.as_ref().unwrap()[0].citations {
-                assert_eq!(citation.links.len(), 1);
+            let citations = &evidence.outcomes[0].result.as_ref().unwrap()[0].citations;
+            assert_eq!(citations.len(), 2);
+            for (citation, (start, end)) in citations.iter().zip([(5, 14), (15, 22)]) {
+                assert_eq!(citation.links, vec![crate::core::SourceLink { start, end }]);
+                assert_eq!(&doc.markdown[start..end], citation.quote);
             }
+            let check_calls = agents.model.calls.lock().unwrap();
+            assert_eq!(check_calls.len(), 2);
+            assert_eq!(check_calls.get("one"), Some(&1));
+            assert_eq!(check_calls.get("failure"), Some(&1));
             assert_eq!(calls.load(Ordering::SeqCst), 1);
         }
     }

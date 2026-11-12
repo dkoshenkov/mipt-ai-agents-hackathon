@@ -2,6 +2,7 @@ use std::{sync::Once, time::Instant};
 
 use tracing_subscriber::prelude::*;
 
+use super::{StageKind, StepError};
 use crate::core::ErrorCategory;
 
 pub(crate) fn init() {
@@ -21,6 +22,60 @@ pub(crate) fn init() {
 fn filter() -> tracing_subscriber::filter::Targets {
     tracing_subscriber::filter::Targets::new()
         .with_target("procurement_review", tracing::Level::INFO)
+}
+
+pub(super) struct TypedStage<'a> {
+    run_id: &'a str,
+    stage: &'static str,
+    started: Instant,
+}
+
+impl<'a> TypedStage<'a> {
+    pub(super) fn start(run_id: &'a str, kind: StageKind) -> Self {
+        init();
+        let stage = match kind {
+            StageKind::Claims => "claims",
+            StageKind::Review => "review",
+        };
+        tracing::info!(run_id, stage, event = "start");
+        Self {
+            run_id,
+            stage,
+            started: Instant::now(),
+        }
+    }
+
+    pub(super) fn dispatch(&self, attempt: usize) {
+        tracing::info!(
+            run_id = self.run_id,
+            stage = self.stage,
+            event = "dispatch",
+            attempt
+        );
+    }
+
+    pub(super) fn finish(&self, result: Result<(), StepError>, attempt: Option<usize>) {
+        let status = match result {
+            Ok(()) => "decoded",
+            Err(StepError::Preparation) => "preparation",
+            Err(StepError::RestrictedContext) => "restricted_context",
+            Err(StepError::BudgetExhausted) => "budget_exhausted",
+            Err(StepError::Model(ErrorCategory::RateLimited)) => "rate_limited",
+            Err(StepError::Model(ErrorCategory::TimedOut)) => "timed_out",
+            Err(StepError::Model(ErrorCategory::InvalidResponse)) => "invalid_response",
+            Err(StepError::Model(ErrorCategory::Provider)) => "provider_error",
+            Err(StepError::Model(ErrorCategory::RestrictedContext)) => "model_restricted_context",
+        };
+        let duration_ms = self.started.elapsed().as_millis() as u64;
+        tracing::info!(
+            run_id = self.run_id,
+            stage = self.stage,
+            event = "finish",
+            attempt,
+            status,
+            duration_ms
+        );
+    }
 }
 
 pub(crate) struct Stage {

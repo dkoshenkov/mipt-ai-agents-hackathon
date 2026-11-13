@@ -1,22 +1,41 @@
 use std::{sync::Once, time::Instant};
 
+use tracing_subscriber::fmt::writer::{BoxMakeWriter, MakeWriterExt};
 use tracing_subscriber::prelude::*;
 
 use super::{StageKind, StepError};
 use crate::core::ErrorCategory;
 
+static INIT: Once = Once::new();
+
 pub(crate) fn init() {
-    static INIT: Once = Once::new();
+    init_logging(None);
+}
+
+/// Initialize filtered JSON events on stderr and in a file before starting a run.
+/// Returns false if logging was already initialized or a subscriber is installed.
+pub fn init_with_file(file: std::fs::File) -> bool {
+    init_logging(Some(file))
+}
+
+fn init_logging(file: Option<std::fs::File>) -> bool {
+    let mut initialized = false;
     INIT.call_once(|| {
-        let _ = tracing_subscriber::registry()
+        let writer = match file {
+            Some(file) => BoxMakeWriter::new(std::io::stderr.and(file)),
+            None => BoxMakeWriter::new(std::io::stderr),
+        };
+        initialized = tracing_subscriber::registry()
             .with(
                 tracing_subscriber::fmt::layer()
                     .json()
-                    .with_writer(std::io::stderr)
+                    .with_writer(writer)
                     .with_filter(filter()),
             )
-            .try_init();
+            .try_init()
+            .is_ok();
     });
+    initialized
 }
 
 fn filter() -> tracing_subscriber::filter::Targets {
@@ -27,20 +46,24 @@ fn filter() -> tracing_subscriber::filter::Targets {
 pub(super) struct TypedStage<'a> {
     run_id: &'a str,
     stage: &'static str,
+    model_role: &'static str,
     started: Instant,
 }
 
 impl<'a> TypedStage<'a> {
     pub(super) fn start(run_id: &'a str, kind: StageKind) -> Self {
         init();
-        let stage = match kind {
-            StageKind::Claims => "claims",
-            StageKind::Review => "review",
+        let (stage, model_role) = match kind {
+            StageKind::Claims => ("claims", "worker"),
+            StageKind::Review => ("review", "reviewer"),
+            StageKind::Control => ("control", "reviewer"),
+            StageKind::Comparison => ("comparison", "reviewer"),
         };
-        tracing::info!(run_id, stage, event = "start");
+        tracing::info!(run_id, stage, model_role, event = "start");
         Self {
             run_id,
             stage,
+            model_role,
             started: Instant::now(),
         }
     }
@@ -49,6 +72,7 @@ impl<'a> TypedStage<'a> {
         tracing::info!(
             run_id = self.run_id,
             stage = self.stage,
+            model_role = self.model_role,
             event = "dispatch",
             attempt
         );
@@ -70,6 +94,7 @@ impl<'a> TypedStage<'a> {
         tracing::info!(
             run_id = self.run_id,
             stage = self.stage,
+            model_role = self.model_role,
             event = "finish",
             attempt,
             status,

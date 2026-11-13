@@ -1,7 +1,10 @@
-use std::future::Future;
+use std::{
+    future::Future,
+    sync::{Arc, Mutex},
+};
 
 use rig_core::{
-    completion::CompletionRequest,
+    completion::{CompletionRequest, Usage},
     error::ProviderError,
     message::StopReason,
     providers::{openai::OpenAI, xai},
@@ -15,20 +18,58 @@ pub trait Model: Send + Sync {
     }
 
     fn complete(&self, prompt: &str) -> impl Future<Output = Result<String, ErrorCategory>> + Send;
+
+    fn complete_structured(
+        &self,
+        prompt: &str,
+        _schema: &schemars::Schema,
+    ) -> impl Future<Output = Result<String, ErrorCategory>> + Send {
+        self.complete(prompt)
+    }
 }
 
 pub struct Grok {
     client: OpenAI,
     model: String,
+    usage: Option<Arc<Mutex<Vec<Usage>>>>,
 }
 
 impl Grok {
+    /// Reads XAI_API_KEY from the environment or `.env` in the working directory.
+    pub fn from_env(model: String) -> Result<Self, &'static str> {
+        let key = match std::env::var("XAI_API_KEY") {
+            Ok(key) => Some(key),
+            Err(std::env::VarError::NotPresent) => std::fs::read_to_string(".env")
+                .ok()
+                .and_then(|content| dotenv_key(&content)),
+            Err(std::env::VarError::NotUnicode(_)) => None,
+        };
+        let key = key
+            .filter(|key| !key.trim().is_empty())
+            .ok_or("Set a non-empty XAI_API_KEY in the environment or .env")?;
+        Ok(Self::new(key, model))
+    }
+
     pub fn new(api_key: String, model: String) -> Self {
         Self {
             client: xai::new(api_key),
             model,
+            usage: None,
         }
     }
+
+    /// Record usage from received responses when explicitly requested.
+    pub fn with_usage_recording(mut self, usage: Arc<Mutex<Vec<Usage>>>) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+}
+
+fn dotenv_key(content: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key.trim() == "XAI_API_KEY").then(|| value.trim().to_owned())
+    })
 }
 
 impl Model for Grok {
@@ -37,12 +78,39 @@ impl Model for Grok {
     }
 
     async fn complete(&self, prompt: &str) -> Result<String, ErrorCategory> {
+        self.send(prompt, None).await
+    }
+
+    async fn complete_structured(
+        &self,
+        prompt: &str,
+        schema: &schemars::Schema,
+    ) -> Result<String, ErrorCategory> {
+        self.send(prompt, Some(schema)).await
+    }
+}
+
+impl Grok {
+    async fn send(
+        &self,
+        prompt: &str,
+        schema: Option<&schemars::Schema>,
+    ) -> Result<String, ErrorCategory> {
+        let mut request = CompletionRequest::new(prompt).preamble(
+            "Return exactly the JSON value requested, without Markdown fences or commentary.",
+        );
+        if let Some(schema) = schema {
+            request = request.output_schema(schema.clone());
+        }
         let response = self
             .client
             .completion(&self.model)
-            .call(CompletionRequest::new(prompt))
+            .call(request)
             .await
             .map_err(|error| classify_error(&error))?;
+        if let Some(usage) = &self.usage {
+            usage.lock().unwrap().push(response.usage);
+        }
         if response
             .raw
             .get("status")
@@ -112,6 +180,15 @@ mod tests {
         http_client::StatusCode, providers::openai::OpenAIConfig, test_utils::RecordingHttpClient,
     };
 
+    #[test]
+    fn reads_only_the_xai_key_from_dotenv() {
+        assert_eq!(
+            dotenv_key("OTHER=ignored\nXAI_API_KEY= test-key\n"),
+            Some("test-key".into())
+        );
+        assert_eq!(dotenv_key("OTHER=ignored"), None);
+    }
+
     fn message(text: &str) -> serde_json::Value {
         serde_json::json!({
             "type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
@@ -132,8 +209,64 @@ mod tests {
         let grok = Grok {
             client: OpenAIConfig::with_key(&xai::DIALECT, "test-key").connect(http.clone()),
             model: "grok-test".into(),
+            usage: None,
         };
         grok.complete("hello").await
+    }
+
+    #[tokio::test]
+    async fn sends_structured_schema_in_responses_wire_format() {
+        let http = RecordingHttpClient::new(completed(vec![message("{}")]).to_string());
+        let grok = Grok {
+            client: OpenAIConfig::with_key(&xai::DIALECT, "test-key").connect(http.clone()),
+            model: "grok-test".into(),
+            usage: None,
+        };
+        let schema: schemars::Schema = serde_json::from_value(serde_json::json!({
+            "title": "test", "type": "object", "properties": {},
+            "required": [], "additionalProperties": false
+        }))
+        .unwrap();
+        assert_eq!(
+            grok.complete_structured("hello", &schema).await,
+            Ok("{}".into())
+        );
+        let requests = http.requests();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["text"]["format"]["type"], "json_schema");
+        assert_eq!(body["text"]["format"]["strict"], true);
+        assert_eq!(
+            body["text"]["format"]["schema"]["additionalProperties"],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn records_usage_even_when_response_is_rejected() {
+        let mut response = completed(vec![message("answer")]);
+        response["status"] = "incomplete".into();
+        response["usage"] = serde_json::json!({
+            "input_tokens": 120, "output_tokens": 30, "total_tokens": 150,
+            "input_tokens_details": {"cached_tokens": 20}
+        });
+        let http = RecordingHttpClient::new(response.to_string());
+        let usage = Arc::new(Mutex::new(Vec::new()));
+        let grok = Grok {
+            client: OpenAIConfig::with_key(&xai::DIALECT, "test-key").connect(http),
+            model: "grok-test".into(),
+            usage: None,
+        }
+        .with_usage_recording(usage.clone());
+        assert_eq!(
+            grok.complete("hello").await,
+            Err(ErrorCategory::InvalidResponse)
+        );
+        let recorded = usage.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].input_tokens, Some(120));
+        assert_eq!(recorded[0].output_tokens, Some(30));
+        assert_eq!(recorded[0].cached_input_tokens, Some(20));
+        assert!(recorded[0].cost.is_none());
     }
 
     #[tokio::test]
@@ -220,8 +353,14 @@ mod tests {
             assert_eq!(requests[0].headers["authorization"], "Bearer test-key");
             let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
             assert_eq!(body["model"], "grok-test");
-            assert_eq!(body["input"][0]["role"], "user");
-            assert_eq!(body["input"][0]["content"][0]["text"], "hello");
+            assert!(body.to_string().contains("without Markdown fences"));
+            let user = body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["role"] == "user")
+                .unwrap();
+            assert_eq!(user["content"][0]["text"], "hello");
         }
     }
 

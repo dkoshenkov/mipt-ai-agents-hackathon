@@ -976,6 +976,7 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "rig-core",
+ "schemars",
  "serde",
  "serde_json",
  "tokio",

@@ -90,6 +90,7 @@ pub(crate) fn stage(name: &'static str, id: &str) -> Stage {
 }
 
 pub(crate) fn model_stage(name: &'static str, id: &str, model: Option<&str>) -> Stage {
+    init();
     let model = model.unwrap_or("");
     tracing::info!(stage = name, id, model, event = "start");
     Stage {

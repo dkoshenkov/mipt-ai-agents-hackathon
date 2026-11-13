@@ -7,7 +7,7 @@ use rig_core::{
     providers::{openai::OpenAI, xai},
 };
 
-use crate::core::ErrorCategory;
+use crate::core::{ErrorCategory, RequestError};
 
 pub trait Model: Send + Sync {
     fn name(&self) -> Option<&str> {
@@ -15,6 +15,11 @@ pub trait Model: Send + Sync {
     }
 
     fn complete(&self, prompt: &str) -> impl Future<Output = Result<String, ErrorCategory>> + Send;
+
+    fn complete_detailed(&self, prompt: &str) -> impl Future<Output = Result<String, RequestError>> + Send {
+        async move { self.complete(prompt).await.map_err(|category| RequestError::new(category, "model", "Model returned an error without additional details")) }
+    }
+
 }
 
 pub struct Grok {
@@ -37,22 +42,26 @@ impl Model for Grok {
     }
 
     async fn complete(&self, prompt: &str) -> Result<String, ErrorCategory> {
+        self.complete_detailed(prompt).await.map_err(|error| error.category)
+    }
+
+    async fn complete_detailed(&self, prompt: &str) -> Result<String, RequestError> {
         let response = self
             .client
             .completion(&self.model)
             .call(CompletionRequest::new(prompt))
             .await
-            .map_err(|error| classify_error(&error))?;
+            .map_err(|error| provider_diagnostic(&error))?;
         if response
             .raw
             .get("status")
             .and_then(|status| status.as_str())
             != Some("completed")
         {
-            return Err(ErrorCategory::InvalidResponse);
+            return Err(RequestError::new(ErrorCategory::InvalidResponse, "response_validation", format!("Unexpected response status: {:?}", response.raw["status"].as_str())));
         }
         if response.stop() != StopReason::Stop {
-            return Err(ErrorCategory::InvalidResponse);
+            return Err(RequestError::new(ErrorCategory::InvalidResponse, "response_validation", format!("Unexpected stop reason: {:?}", response.stop())));
         }
         // Rig 0.46 keeps these client-executed Responses items opaque.
         let client_action = response.raw["output"].as_array().is_some_and(|output| {
@@ -78,10 +87,23 @@ impl Model for Grok {
             })
         });
         if response.tool_calls().next().is_some() || client_action || refusal {
-            return Err(ErrorCategory::InvalidResponse);
+            return Err(RequestError::new(ErrorCategory::InvalidResponse, "response_validation", format!("Rejected response: tool_calls={}, client_action={client_action}, refusal={refusal}", response.tool_calls().count())));
         }
-        response_text(response.text())
+        response_text(response.text()).map_err(|category| RequestError::new(category, "response_text", "Response contains no text"))
     }
+}
+
+fn provider_diagnostic(error: &ProviderError) -> RequestError {
+    let reason = match error {
+        ProviderError::Http(_) => "Transport failure",
+        ProviderError::Json(_) => "Provider envelope JSON could not be decoded",
+        ProviderError::Response(_) => "Provider response does not match the SDK response contract",
+        ProviderError::InvalidAuthentication(_) => "Authentication rejected",
+        _ => "Provider request failed",
+    };
+    let mut diagnostic = RequestError::new(classify_error(error), "provider", reason);
+    diagnostic.http_status = error.provider_response_status().map(|status| status.as_u16());
+    diagnostic
 }
 
 fn response_text(text: String) -> Result<String, ErrorCategory> {

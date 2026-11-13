@@ -39,17 +39,19 @@ let report = match critic.review(document, &evidence, &[]).await {
 
 ## Подключение Grok
 
-Для реальных запросов создайте `Grok` с ключом xAI и именем доступной модели и передайте его в `Runtime` вместо локальной модели. В примере конфигурация читается из окружения.
+Задайте `XAI_API_KEY` в окружении или в файле `.env` рабочего каталога. Переменная окружения имеет приоритет. В примере первичное извлечение использует non-reasoning модель, а контроль, сравнение и проверка используют reasoning-модель.
 
 ```rust
 use std::time::Duration;
 use procurement_review::runtime::{grok::Grok, Runtime};
 
-fn grok_runtime() -> Result<Runtime<Grok>, std::env::VarError> {
-    let api_key = std::env::var("XAI_API_KEY")?;
-    let model = std::env::var("XAI_MODEL")?;
-    Ok(Runtime::new(Grok::new(api_key, model), Duration::from_secs(30)))
+fn grok_runtime() -> Result<Runtime<Grok>, &'static str> {
+    let worker = Grok::from_env("grok-4.20-0309-non-reasoning".into())?;
+    let reviewer = Grok::from_env("grok-4.20-0309-reasoning".into())?;
+    Ok(Runtime::new(worker, Duration::from_secs(60)).with_reviewer(reviewer))
 }
 ```
+
+`StageRequest::schema` передаёт JSON Schema в xAI при запросах структурированных ответов. Для записи событий в файл и stderr вызовите `runtime::logging::init_with_file(file)` до запуска. Журнал типизированных этапов сохраняет роль, запуск, попытку и исход. Для статистики полученных ответов доступен `Grok::with_usage_recording`.
 
 `review_223` принимает отдельные `Runtime` для проверок и критика. Перед внешней отправкой документ и все материалы проверок должны иметь статус `Visibility::Public`.

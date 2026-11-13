@@ -32,12 +32,27 @@ pub enum InputError {
 
 pub struct Runtime<M> {
     pub(crate) model: M,
+    pub(crate) reviewer: Option<M>,
     pub(crate) timeout: Duration,
 }
 
 impl<M: Model> Runtime<M> {
     pub fn new(model: M, timeout: Duration) -> Self {
-        Self { model, timeout }
+        Self {
+            model,
+            reviewer: None,
+            timeout,
+        }
+    }
+
+    /// Use a separate model for review and comparison stages.
+    pub fn with_reviewer(mut self, reviewer: M) -> Self {
+        self.reviewer = Some(reviewer);
+        self
+    }
+
+    pub(crate) fn reviewer(&self) -> &M {
+        self.reviewer.as_ref().unwrap_or(&self.model)
     }
 
     pub async fn run_parallel(
@@ -50,9 +65,11 @@ impl<M: Model> Runtime<M> {
     }
 
     async fn run_check(&self, document: &Document, check: &Check) -> CheckOutcome {
-        let stage = logging::model_stage("check", &check.id, self.model.name());
-        let result: Result<Vec<Finding>, _> =
-            self.request_json(&check_prompt(document, check)).await;
+        let model = self.reviewer();
+        let stage = logging::model_stage("check", &check.id, model.name());
+        let result: Result<Vec<Finding>, _> = self
+            .request_json(model, &check_prompt(document, check))
+            .await;
         stage.finish_result(&result);
         CheckOutcome {
             check_id: check.id.clone(),
@@ -62,9 +79,25 @@ impl<M: Model> Runtime<M> {
 
     pub(crate) async fn request_json<T: DeserializeOwned>(
         &self,
+        model: &M,
         prompt: &str,
     ) -> Result<T, ErrorCategory> {
-        match tokio::time::timeout(self.timeout, self.model.complete(prompt)).await {
+        self.request_json_with_schema(model, prompt, None).await
+    }
+
+    pub(crate) async fn request_json_with_schema<T: DeserializeOwned>(
+        &self,
+        model: &M,
+        prompt: &str,
+        schema: Option<&schemars::Schema>,
+    ) -> Result<T, ErrorCategory> {
+        let complete = async {
+            match schema {
+                Some(schema) => model.complete_structured(prompt, schema).await,
+                None => model.complete(prompt).await,
+            }
+        };
+        match tokio::time::timeout(self.timeout, complete).await {
             Ok(Ok(response)) => {
                 serde_json::from_str(&response).map_err(|_| ErrorCategory::InvalidResponse)
             }

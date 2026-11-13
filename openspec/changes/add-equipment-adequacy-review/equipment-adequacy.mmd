@@ -1,0 +1,52 @@
+---
+config:
+  theme: base
+  htmlLabels: false
+  fontFamily: "Arial, sans-serif"
+  themeVariables:
+    fontFamily: "Arial, sans-serif"
+    fontSize: "16px"
+    primaryColor: "#f7f9fb"
+    primaryTextColor: "#173247"
+    primaryBorderColor: "#69808c"
+    lineColor: "#506676"
+    edgeLabelBackground: "#ffffff"
+  flowchart:
+    htmlLabels: false
+    curve: linear
+    nodeSpacing: 26
+    rankSpacing: 34
+    padding: 12
+    wrappingWidth: 255
+    subGraphTitleMargin:
+      top: 8
+      bottom: 20
+---
+flowchart TD
+    accTitle: Проверка всех требований и один финальный проход ревьюера
+    accDescr: Агент сохраняет исходные фрагменты и отсылки. Во внешний цикл попадают обязательные для позиции условия. Справочные строки паспорта доступны как доказательства. После обхода более сильная модель один раз проверяет пропуски, лишние записи и оценки, включая случай пустого списка. Привязанные замечания позволяют объединить записи или снять лишнюю. Непроверенная правка даёт частичное покрытие.
+    Start([Начало]) --> Input[/"ТЗ и приложения одной редакции"/]
+    Input --> Scope["Сохранить фрагменты и отсылки<br/>Отметить справочные строки"]
+    Scope --> List["Выделить требования 1…N<br/>Только обязательные условия<br/>Альтернативы — одна запись"]
+    List --> More{"Есть следующее<br/>требование?"}
+    More -->|Да| Check[["Проверить требование i"]]
+    Check --> Save["Сохранить исход<br/>Перейти к следующему i"]
+    Save ==>|Следующее требование| More
+
+    More -->|Нет| Review[["Один проход более сильного ревьюера<br/>Сверить обязательные условия, записи<br/>и основания решений"]]
+    Review --> State{"Результат ревью?"}
+    State -->|Есть замечания| Fix["По цитате добавить, объединить<br/>или снять запись, пересмотреть оценку<br/>или задать вопрос"]
+    State -->|Замечаний нет| Reconcile["Локально сверить условия и записи<br/>Проверить исход каждого замечания"]
+    Fix --> Reconcile
+    State -->|Сбой или отказ| Partial["Сохранить результаты<br/>Указать причину неполной сверки"]
+    Reconcile --> Report[/"Отчёт с результатами, вопросами<br/>и фактическим покрытием"/]
+    Partial --> Report
+    Report --> End([Конец])
+
+    classDef outer fill:#ddf3e7,stroke:#12794b,color:#12432e,stroke-width:2px
+    classDef inner fill:#dff1fc,stroke:#116b9b,color:#12384e,stroke-width:2px
+    classDef review fill:#f0eafb,stroke:#72509a,color:#36254d,stroke-width:2px
+    class More,Save outer
+    class Check inner
+    class Review,Reconcile review
+    linkStyle 6 stroke:#12794b,stroke-width:4px

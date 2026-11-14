@@ -33,6 +33,7 @@ pub async fn resume_equipment_adequacy<M: SearchModel, H: HttpTransport>(
         run: &run,
         options,
         reserve_review: false,
+        remaining_requirements: 0,
     };
     let mut session = SourceSession {
         transport: sources,

@@ -1,0 +1,13 @@
+**
+!Cargo.toml
+!Cargo.lock
+!223fz_27_agents_ru_unified.json
+!src/
+!src/**
+!ui/
+!ui/**
+!scripts/
+!scripts/docx_markdown.py
+!scripts/docx-requirements.txt
+!docker/
+!docker/**

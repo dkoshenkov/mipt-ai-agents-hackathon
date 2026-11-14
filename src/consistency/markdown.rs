@@ -215,23 +215,26 @@ impl MarkdownIndex {
         {
             return None;
         }
-        let text = self.source[block.range.clone()].trim();
+        // Formatting delimiters and HTML tags are outside the parser's visible text ranges.
+        let visible = |b: &Block| {
+            b.text_ranges
+                .iter()
+                .map(|range| &self.source[range.clone()])
+                .collect::<String>()
+        };
+        let text = visible(block);
+        let text = text.trim();
         let defect_title = block.kind == BlockKind::Paragraph
             && text.to_lowercase().starts_with("на выполнение работ по ")
             && self
                 .blocks
                 .get(block.id.wrapping_sub(1))
                 .is_some_and(|heading| {
-                    heading.kind == BlockKind::Heading
-                        && block.headings.last() == Some(&heading.id)
+                    matches!(heading.kind, BlockKind::Heading | BlockKind::Paragraph)
                         && self.source[heading.range.end..block.range.start]
                             .trim()
                             .is_empty()
-                        && self.source[heading.range.clone()]
-                            .trim_start_matches('#')
-                            .trim()
-                            .to_lowercase()
-                            == "дефектная ведомость"
+                        && visible(heading).trim().to_lowercase() == "дефектная ведомость"
                 });
         (text.ends_with(':') || defect_title).then_some(block.id)
     }

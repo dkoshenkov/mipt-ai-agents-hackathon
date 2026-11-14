@@ -141,7 +141,7 @@ pub(super) fn recovered(index: &MarkdownIndex, found: &super::claims::Grounded) 
     })
 }
 
-fn parse_prefix(text: &str) -> Option<(Key, usize)> {
+pub(super) fn parse_prefix(text: &str) -> Option<(Key, usize)> {
     let (first, mut pos) = word(text, 0)?;
     if !matches!(
         first.as_str(),
@@ -297,6 +297,8 @@ pub struct ReferenceReview {
     /// Similar local cards are candidates only; they do not establish a replacement.
     #[serde(default)]
     pub variants: Vec<Variant>,
+    #[serde(default)]
+    pub confirmed_family_variants: Vec<Card>,
     pub date_status: Vec<DateStatus>,
     pub snapshot_date: String,
     pub assessment_date: String,
@@ -307,6 +309,35 @@ pub struct Variant {
     pub component: VariantComponent,
     pub original: String,
     pub alternative: String,
+}
+/// A family variant must have the same dated number and its title in the source context.
+pub(super) fn confirmed_family_variant(key: &Key, card: &Card, context: &str) -> bool {
+    let Some((other, end)) = parse_prefix(&card.designation) else {
+        return false;
+    };
+    let normalize = |s: &str| {
+        s.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
+    let context = normalize(context);
+    let title = normalize(&card.title);
+    let title_matches = !title.is_empty()
+        && (context
+            .split('«')
+            .skip(1)
+            .filter_map(|s| s.split_once('»').map(|(s, _)| s))
+            .any(|s| s == title)
+            || context.split('"').skip(1).step_by(2).any(|s| s == title)
+            || context.split('|').any(|s| s.trim() == title));
+    end == card.designation.len()
+        && key.year.is_some()
+        && other.year == key.year
+        && other.number == key.number
+        && other.family != key.family
+        && card_identity_valid(card)
+        && title_matches
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum VariantComponent {
@@ -373,6 +404,7 @@ impl Catalog {
                             })
                         })
                         .collect(),
+                    confirmed_family_variants: Vec::new(),
                     date_status,
                     snapshot_date: self.retrieved_at.clone(),
                     assessment_date: assessment_date.to_owned(),

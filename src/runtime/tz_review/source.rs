@@ -69,6 +69,11 @@ impl<'a> Source<'a> {
                                 !value.trim_matches([' ', '|']).is_empty()
                             })
                         })
+                        || lower.split("<tr").any(|row| {
+                            row.split_once("<p>модель</p></td><td><p>")
+                                .and_then(|(_, value)| value.split_once("</p>"))
+                                .is_some_and(|(value, _)| !value.trim().is_empty())
+                        })
                         || lower
                             .split('|')
                             .map(str::trim)
@@ -210,5 +215,19 @@ impl<'a> Source<'a> {
             heading: heading.to_owned(),
             table_header: header,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Source;
+
+    #[test]
+    fn html_table_model_uses_the_physical_line() {
+        let source = Source::new(
+            "Заголовок\n<table><tr><td><p>Модель</p></td><td><p>0505М-01 или эквивалент</p></td></tr></table>\n",
+        );
+        assert_eq!(source.brand_lines(), [2]);
+        assert_eq!(source.line(2).unwrap().line, 2);
     }
 }

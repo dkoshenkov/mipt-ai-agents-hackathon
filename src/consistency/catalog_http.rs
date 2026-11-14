@@ -165,7 +165,7 @@ impl<T: Transport> CatalogHttp<T> {
         } else if !valid_key(key) {
             Outcome::InvalidDesignation
         } else {
-            self.search(key, &mut cards).await
+            self.search(key, &mut cards, false).await
         };
         Lookup {
             key: key.clone(),
@@ -177,7 +177,27 @@ impl<T: Transport> CatalogHttp<T> {
             requests: self.requests[start..].to_vec(),
         }
     }
-    async fn search(&mut self, key: &Key, cards: &mut Vec<Card>) -> Outcome {
+    pub async fn lookup_family_variants(&mut self, visibility: Visibility, key: &Key) -> Lookup {
+        let start = self.requests.len();
+        let mut cards = Vec::new();
+        let outcome = if visibility != Visibility::Public {
+            Outcome::Restricted
+        } else if !valid_key(key) || key.year.is_none() {
+            Outcome::InvalidDesignation
+        } else {
+            self.search(key, &mut cards, true).await
+        };
+        Lookup {
+            key: key.clone(),
+            catalog: Catalog {
+                retrieved_at: self.retrieved_at.clone(),
+                cards,
+            },
+            outcome,
+            requests: self.requests[start..].to_vec(),
+        }
+    }
+    async fn search(&mut self, key: &Key, cards: &mut Vec<Card>, variants: bool) -> Outcome {
         let mut page = 1usize;
         let mut total = None;
         let mut seen = std::collections::HashSet::new();
@@ -216,13 +236,28 @@ impl<T: Transport> CatalogHttp<T> {
                 if !seen.insert(id.clone()) {
                     return Outcome::InvalidMarkup;
                 }
-                if matches_key(&designation, key) {
+                let candidate =
+                    super::standards::parse_prefix(&designation).and_then(|(candidate, end)| {
+                        (end == designation.len()
+                            && valid_key(&candidate)
+                            && candidate.number == key.number
+                            && candidate.year == key.year
+                            && candidate.family != key.family)
+                            .then_some(candidate)
+                    });
+                if (!variants && matches_key(&designation, key))
+                    || (variants && candidate.is_some())
+                {
                     let path = format!("/gost/details/{id}");
                     let response = match self.fetch(&path).await {
                         Ok(v) => v,
                         Err(e) => return e,
                     };
-                    match parse_card(&response.body, &path, key) {
+                    match parse_card(
+                        &response.body,
+                        &path,
+                        candidate.as_ref().filter(|_| variants).unwrap_or(key),
+                    ) {
                         Some(card) => cards.push(card),
                         None => return Outcome::InvalidMarkup,
                     }
@@ -662,5 +697,222 @@ mod tests {
                 Outcome::Found | Outcome::NotFound
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn exact_miss_preserves_status_and_shows_title_confirmed_family_variant() {
+        use crate::{
+            consistency::{ReviewOptions, review_with_catalog},
+            core::{Document, ErrorCategory},
+            runtime::{Runtime, grok::Model},
+        };
+        struct Replay;
+        impl Model for Replay {
+            async fn complete(&self, _: &str) -> Result<String, ErrorCategory> {
+                Ok(r#"{"claims":[],"priority_rules":[],"refinements":[],"standard_mentions":[],"role":"bibliography","outcome":"insufficient_evidence"}"#.into())
+            }
+        }
+        let list = list(1, 0, 1, true).replace("ГОСТ 9013-59", "ГОСТ 34441-2018");
+        let card = card()
+            .replace("ГОСТ 9013-59", "ГОСТ 34441-2018")
+            .replace(
+                "Стандарт",
+                "Лифты. Диспетчерский контроль. Общие технические требования",
+            )
+            .replace("Действует", "Заменен")
+            + "<div><span>Обозначение заменяющего</span><p class=\"value\">ГОСТ 34441-2024</p></div>";
+        let mut client = CatalogHttp::with_transport(
+            Fake(Mutex::new(vec![response(&list), response(&card)])),
+            2,
+            2,
+            "2026-11-13",
+        );
+        let document = Document {
+            markdown:
+                "ГОСТ Р 34441-2018 «Лифты. Диспетчерский контроль. Общие технические требования»"
+                    .into(),
+            visibility: Visibility::Public,
+        };
+        let catalog = Catalog {
+            retrieved_at: "2026-11-13".into(),
+            cards: vec![],
+        };
+        let runtime = Runtime::new(Replay, std::time::Duration::from_secs(1));
+        let report = review_with_catalog(
+            &document,
+            ReviewOptions {
+                model_attempts: 3,
+                ..Default::default()
+            },
+            &runtime,
+            &catalog,
+            Some(&mut client),
+        )
+        .await
+        .unwrap();
+        let row = &report.standard_references[0];
+        assert!(matches!(
+            row.existence,
+            super::super::standards::Existence::NotFoundInOfficialSearch
+        ));
+        assert!(row.cards.is_empty());
+        assert_eq!(row.confirmed_family_variants.len(), 1);
+        assert_eq!(
+            row.confirmed_family_variants[0].status_at_retrieval,
+            "Заменен"
+        );
+        assert_eq!(
+            row.confirmed_family_variants[0].replacement.as_deref(),
+            Some("ГОСТ 34441-2024")
+        );
+        assert_eq!(client.total_requests(), 2);
+        assert!(matches!(report.catalog_trace[0].outcome, Outcome::NotFound));
+        for (title, limit) in [
+            ("Совершенно другое название", 2),
+            (
+                "Лифты. Диспетчерский контроль. Общие технические требования для пассажиров",
+                2,
+            ),
+            (
+                "Лифты. Диспетчерский контроль. Общие технические требования",
+                1,
+            ),
+        ] {
+            let mut client = CatalogHttp::with_transport(
+                Fake(Mutex::new(vec![response(&list), response(&card)])),
+                limit,
+                2,
+                "2026-11-13",
+            );
+            let document = Document {
+                markdown: format!("ГОСТ Р 34441-2018 «{title}»"),
+                visibility: Visibility::Public,
+            };
+            let report = review_with_catalog(
+                &document,
+                ReviewOptions {
+                    model_attempts: 3,
+                    ..Default::default()
+                },
+                &runtime,
+                &catalog,
+                Some(&mut client),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                report.standard_references[0].existence,
+                super::super::standards::Existence::NotFoundInOfficialSearch
+            ));
+            assert!(
+                report.standard_references[0]
+                    .confirmed_family_variants
+                    .is_empty()
+            );
+        }
+        let mut client = CatalogHttp::with_transport(
+            Fake(Mutex::new(vec![response(&list), response("invalid card")])),
+            2,
+            2,
+            "2026-11-13",
+        );
+        let report = review_with_catalog(
+            &document,
+            ReviewOptions {
+                model_attempts: 3,
+                ..Default::default()
+            },
+            &runtime,
+            &catalog,
+            Some(&mut client),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            report.standard_references[0].existence,
+            super::super::standards::Existence::NotFoundInOfficialSearch
+        ));
+        assert!(
+            report.standard_references[0]
+                .confirmed_family_variants
+                .is_empty()
+        );
+        assert!(matches!(
+            report.catalog_trace[1].outcome,
+            Outcome::InvalidMarkup
+        ));
+        let mut client = CatalogHttp::with_transport(
+            Fake(Mutex::new(vec![
+                response(&list),
+                response("Найдено: <strong>0</strong><h3>Документы не найдены</h3>"),
+                response(&card),
+            ])),
+            20,
+            2,
+            "2026-11-13",
+        );
+        let document = Document { markdown: "ГОСТ Р 34441-2018 «Лифты. Диспетчерский контроль. Общие технические требования»\n\nГОСТ 9999-2018".into(), visibility: Visibility::Public };
+        let report = review_with_catalog(
+            &document,
+            ReviewOptions {
+                model_attempts: 3,
+                ..Default::default()
+            },
+            &runtime,
+            &catalog,
+            Some(&mut client),
+        )
+        .await
+        .unwrap();
+        assert_eq!(client.total_requests(), 3);
+        assert!(report.catalog_trace[1].requests[0].contains("search=9999"));
+        assert_eq!(
+            report.standard_references[0]
+                .confirmed_family_variants
+                .len(),
+            1
+        );
+        let mut responses = vec![response(&list)];
+        responses.extend(
+            (0..19).map(|_| response("Найдено: <strong>0</strong><h3>Документы не найдены</h3>")),
+        );
+        let mut client =
+            CatalogHttp::with_transport(Fake(Mutex::new(responses)), 20, 2, "2026-11-13");
+        let mut markdown =
+            "ГОСТ Р 34441-2018 «Лифты. Диспетчерский контроль. Общие технические требования»"
+                .to_owned();
+        for n in 50000..50019 {
+            markdown.push_str(&format!("\n\nГОСТ {n}-2018"));
+        }
+        let document = Document {
+            markdown,
+            visibility: Visibility::Public,
+        };
+        let report = review_with_catalog(
+            &document,
+            ReviewOptions {
+                model_attempts: 3,
+                ..Default::default()
+            },
+            &runtime,
+            &catalog,
+            Some(&mut client),
+        )
+        .await
+        .unwrap();
+        assert_eq!(client.total_requests(), 20);
+        assert!(matches!(
+            report.standard_references[0].existence,
+            super::super::standards::Existence::NotFoundInOfficialSearch
+        ));
+        assert!(
+            report.standard_references[0]
+                .confirmed_family_variants
+                .is_empty()
+        );
+        assert!(matches!(
+            report.catalog_trace[20].outcome,
+            Outcome::RequestLimit
+        ));
     }
 }

@@ -11,6 +11,23 @@ use rig_core::{
 };
 
 use super::CheckInput;
+
+/// Provider diagnostics and an optional server-requested retry delay.
+#[derive(Debug)]
+pub struct RetryError {
+    pub error: RequestError,
+    pub retry_after: Option<std::time::Duration>,
+}
+
+impl From<RequestError> for RetryError {
+    fn from(error: RequestError) -> Self {
+        Self {
+            error,
+            retry_after: None,
+        }
+    }
+}
+
 use crate::core::{ErrorCategory, RequestError};
 
 pub trait Model: Send + Sync {
@@ -40,6 +57,20 @@ pub trait Model: Send + Sync {
         _schema: &schemars::Schema,
     ) -> impl Future<Output = Result<String, ErrorCategory>> + Send {
         self.complete(prompt)
+    }
+
+    fn complete_retryable(
+        &self,
+        prompt: &str,
+        schema: Option<&schemars::Schema>,
+    ) -> impl Future<Output = Result<String, RetryError>> + Send {
+        async move {
+            match schema {
+                Some(schema) => self.complete_structured_detailed(prompt, schema).await,
+                None => self.complete_detailed(prompt).await,
+            }
+            .map_err(RetryError::from)
+        }
     }
 
     fn complete_structured_detailed(
@@ -146,6 +177,14 @@ impl Model for Grok {
             .map_err(|error| error.category)
     }
 
+    async fn complete_retryable(
+        &self,
+        prompt: &str,
+        schema: Option<&schemars::Schema>,
+    ) -> Result<String, RetryError> {
+        self.send_messages_retryable(prompt, None, schema).await
+    }
+
     async fn complete_structured_detailed(
         &self,
         prompt: &str,
@@ -170,6 +209,17 @@ impl Grok {
         dynamic: Option<&str>,
         schema: Option<&schemars::Schema>,
     ) -> Result<String, RequestError> {
+        self.send_messages_retryable(prompt, dynamic, schema)
+            .await
+            .map_err(|error| error.error)
+    }
+
+    async fn send_messages_retryable(
+        &self,
+        prompt: &str,
+        dynamic: Option<&str>,
+        schema: Option<&schemars::Schema>,
+    ) -> Result<String, RetryError> {
         // Rig places message history before the prompt in the wire request.
         let mut request = CompletionRequest::new(dynamic.unwrap_or(prompt)).preamble(
             "Return exactly the JSON value requested, without Markdown fences or commentary.",
@@ -188,7 +238,14 @@ impl Grok {
             .completion(&self.model)
             .call(request)
             .await
-            .map_err(|error| provider_diagnostic(&error))?;
+            .map_err(|error| provider_retry_error(&error))?;
+        tracing::info!(
+            model = self.model,
+            event = "usage",
+            input_tokens = response.usage.input_tokens,
+            output_tokens = response.usage.output_tokens,
+            total_tokens = response.usage.total_tokens
+        );
         if let Some(usage) = &self.usage {
             usage.lock().unwrap().push(response.usage);
         }
@@ -198,7 +255,7 @@ impl Grok {
             response.tool_calls().count(),
         )?;
         response_text(response.text()).map_err(|category| {
-            RequestError::new(category, "response_text", "Response contains no text")
+            RequestError::new(category, "response_text", "Response contains no text").into()
         })
     }
 }
@@ -273,6 +330,36 @@ fn provider_diagnostic(error: &ProviderError) -> RequestError {
     diagnostic
 }
 
+fn provider_retry_error(error: &ProviderError) -> RetryError {
+    RetryError {
+        error: provider_diagnostic(error),
+        retry_after: error
+            .provider_response_headers()
+            .and_then(|headers| headers.get("retry-after"))
+            .and_then(|value| value.to_str().ok())
+            .and_then(retry_after_ms)
+            .map(std::time::Duration::from_millis),
+    }
+}
+
+fn retry_after_ms(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Some(
+            value
+                .parse::<u64>()
+                .unwrap_or(u64::MAX)
+                .saturating_mul(1000),
+        );
+    }
+    let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    Some(
+        date.signed_duration_since(chrono::Utc::now())
+            .num_milliseconds()
+            .max(0) as u64,
+    )
+}
+
 fn response_text(text: String) -> Result<String, ErrorCategory> {
     if text.trim().is_empty() {
         Err(ErrorCategory::InvalidResponse)
@@ -287,6 +374,26 @@ impl super::search::SearchModel for Grok {
         prompt: &str,
         max_turns: usize,
     ) -> Result<super::search::SearchResult, ErrorCategory> {
+        self.search_retryable(prompt, max_turns)
+            .await
+            .map_err(|error| error.error.category)
+    }
+
+    async fn search_detailed(
+        &self,
+        prompt: &str,
+        max_turns: usize,
+    ) -> Result<super::search::SearchResult, RequestError> {
+        self.search_retryable(prompt, max_turns)
+            .await
+            .map_err(|error| error.error)
+    }
+
+    async fn search_retryable(
+        &self,
+        prompt: &str,
+        max_turns: usize,
+    ) -> Result<super::search::SearchResult, RetryError> {
         let response = self
             .client
             .completion(&self.model)
@@ -296,7 +403,14 @@ impl super::search::SearchModel for Grok {
                 })),
             )
             .await
-            .map_err(|error| classify_error(&error))?;
+            .map_err(|error| provider_retry_error(&error))?;
+        tracing::info!(
+            model = self.model,
+            event = "usage",
+            input_tokens = response.usage.input_tokens,
+            output_tokens = response.usage.output_tokens,
+            total_tokens = response.usage.total_tokens
+        );
         if let Some(usage) = &self.usage {
             usage.lock().unwrap().push(response.usage);
         }
@@ -304,9 +418,8 @@ impl super::search::SearchModel for Grok {
             &response.raw,
             response.stop(),
             response.tool_calls().count(),
-        )
-        .map_err(|error| error.category)?;
-        let text = response_text(response.text())?;
+        )?;
+        let text = response_text(response.text()).map_err(model_error)?;
         let mut result = super::search::SearchResult {
             text,
             tool_usage: response.raw["server_side_tool_usage"].clone(),
@@ -373,6 +486,32 @@ mod tests {
     use rig_core::{
         http_client::StatusCode, providers::openai::OpenAIConfig, test_utils::RecordingHttpClient,
     };
+
+    #[tokio::test]
+    async fn response_headers_reach_retry_diagnostic() {
+        let mut headers = rig_core::http_client::HeaderMap::new();
+        headers.insert("retry-after", "7".parse().unwrap());
+        let http = RecordingHttpClient::with_error_headers(
+            StatusCode::TOO_MANY_REQUESTS,
+            "private body",
+            headers,
+        );
+        let grok = Grok {
+            client: OpenAIConfig::with_key(&xai::DIALECT, "test-key").connect(http),
+            model: "grok-test".into(),
+            usage: None,
+            prompt_cache_key: None,
+        };
+        let error = grok
+            .send_messages_retryable("private prompt", None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.error.http_status, Some(429));
+        assert_eq!(error.error.reason, "Provider request failed");
+        assert_eq!(error.retry_after, Some(std::time::Duration::from_secs(7)));
+        assert!(retry_after_ms("Wed, 21 Oct 2015 07:28:00 GMT").is_some());
+        assert_eq!(retry_after_ms("invalid"), None);
+    }
 
     #[test]
     fn reads_only_the_xai_key_from_dotenv() {

@@ -306,7 +306,10 @@ pub async fn review_with_mode<M: Model>(
     if full {
         report.stage_log.push(json!({"stage":"A01","result":plan}));
     }
-    report.applicability_source = plan.line.and_then(|n| source.line(n));
+    report.applicability_source = plan.line.and_then(|n| source.line(n)).filter(|loc| {
+        let quote = loc.quote.trim();
+        !(quote.starts_with("<a id=\"_Toc") && quote.ends_with("</a>"))
+    });
     if report.applicability_source.is_none()
         && (plan.regime != Regime::Uncertain || plan.line.is_some())
     {

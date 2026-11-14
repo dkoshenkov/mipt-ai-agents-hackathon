@@ -6,6 +6,8 @@ use super::{
 use crate::runtime::{StageKind, StageRequest, search::SearchModel};
 use std::collections::HashSet;
 
+pub(super) const INDEPENDENT_BASIS_FEEDBACK: &str = "Cite an independent operational basis. If a customer fact is missing, return ask with a concrete question.";
+
 pub(crate) async fn assess<M: SearchModel, H: HttpTransport>(
     report: &mut QualificationReport,
     record: &mut RequirementRecord,
@@ -13,7 +15,9 @@ pub(crate) async fn assess<M: SearchModel, H: HttpTransport>(
     sources: &mut SourceSession<'_, H>,
 ) {
     let mut read = HashSet::new();
+    let mut first = true;
     let outcome = loop {
+        update_reservation_record(report, record, work);
         let answers: Vec<_> = report
             .clarifications
             .iter()
@@ -22,84 +26,46 @@ pub(crate) async fn assess<M: SearchModel, H: HttpTransport>(
         let data = serde_json::json!({"current_requirement":record.requirement,"blocks":report.blocks,
             "confirmed_facts":record.facts,"source_origins":report.external_sources,
             "read_evidence":record.read_evidence,"answers":answers});
-        let decision: Decision = match work
-            .call(
-                prompts::ASSESS,
+        let (decision, sources_for_decision) = match work
+            .call_checked(
+                report, first, prompts::ASSESS,
                 &data,
-                &report.visibility(),
                 StageKind::Claims,
+                |decision| {
+                    let evidence = validate_decision(report, record, &decision, !answers.is_empty()).inspect_err(|detail| {
+                        tracing::warn!(run_id = work.run.id(), requirement_id = %record.requirement.id,
+                            stage = "assessment", event = "decision_rejected", detail);
+                    })?;
+                    Ok((decision, evidence))
+                },
             )
             .await
         {
             Ok(value) => value,
             Err(reason) => break stopped(report, &record.requirement, "assessment", reason),
         };
-        if decision.requirement_id() != record.requirement.id {
-            break stopped(
-                report,
-                &record.requirement,
-                "assessment",
-                FailureReason::InvalidResponse,
-            );
-        }
+        first = false;
         match decision {
             Decision::Assess {
                 assessment,
                 operation,
                 reason,
-                evidence,
                 allowed_case,
                 alternative,
                 margin,
                 ..
             } => {
-                let evidence = match materials::resolve_all(&report.blocks, &evidence) {
-                    Ok(refs) => refs,
-                    Err(reason) => {
-                        break stopped(report, &record.requirement, "assessment", reason);
-                    }
-                };
-                let basis = evidence
-                    .iter()
-                    .any(|s| !record.requirement.evidence.contains(s))
-                    || !record.facts.is_empty()
-                    || !answers.is_empty();
-                if operation.trim().is_empty()
-                    || reason.trim().is_empty()
-                    || evidence.is_empty()
-                    || !basis
-                    || (assessment == Assessment::Insufficient
-                        && allowed_case.as_ref().is_none_or(|s| s.trim().is_empty()))
-                    || (assessment == Assessment::PossiblyExcessive
-                        && (alternative.as_ref().is_none_or(|s| s.trim().is_empty())
-                            || margin.as_ref().is_none_or(|s| s.trim().is_empty())))
-                {
-                    break stopped(
-                        report,
-                        &record.requirement,
-                        "assessment",
-                        FailureReason::InvalidResponse,
-                    );
-                }
                 break RequirementOutcome::Assessed {
                     assessment,
                     operation,
                     reason,
-                    evidence,
+                    evidence: sources_for_decision,
                     allowed_case,
                     alternative,
                     margin,
                 };
             }
             Decision::Ask { fact, question, .. } => {
-                if fact.trim().is_empty() || question.trim().is_empty() {
-                    break stopped(
-                        report,
-                        &record.requirement,
-                        "assessment",
-                        FailureReason::InvalidResponse,
-                    );
-                }
                 break RequirementOutcome::Pending {
                     missing_fact: fact.clone(),
                     question: Some(Question {
@@ -110,18 +76,6 @@ pub(crate) async fn assess<M: SearchModel, H: HttpTransport>(
                 };
             }
             Decision::Read { block_ids, .. } => {
-                if block_ids.is_empty()
-                    || block_ids
-                        .iter()
-                        .any(|id| !report.blocks.iter().any(|b| &b.id == id))
-                {
-                    break stopped(
-                        report,
-                        &record.requirement,
-                        "read",
-                        FailureReason::InvalidResponse,
-                    );
-                }
                 if block_ids.iter().all(|id| read.contains(id)) {
                     break RequirementOutcome::Pending {
                         missing_fact: "No new evidence in repeated read".into(),
@@ -145,17 +99,6 @@ pub(crate) async fn assess<M: SearchModel, H: HttpTransport>(
                 }
             }
             Decision::TechnicalFact { target, query, .. } => {
-                if target.model.trim().is_empty()
-                    || target.parameter.trim().is_empty()
-                    || query.trim().is_empty()
-                {
-                    break stopped(
-                        report,
-                        &record.requirement,
-                        "source",
-                        FailureReason::InvalidResponse,
-                    );
-                }
                 if record.facts.iter().any(|f| f.target == target) {
                     break RequirementOutcome::Pending {
                         missing_fact: format!(
@@ -207,6 +150,92 @@ pub(crate) async fn assess<M: SearchModel, H: HttpTransport>(
     record.outcome = outcome;
 }
 
+fn update_reservation_record<M>(
+    report: &mut QualificationReport,
+    record: &RequirementRecord,
+    work: &Work<'_, M>,
+) {
+    if work.reserve_review
+        && let Some(current) = report
+            .requirements
+            .iter_mut()
+            .find(|r| r.requirement.id == record.requirement.id)
+    {
+        *current = record.clone();
+    }
+}
+
+fn validate_decision(
+    report: &QualificationReport,
+    record: &RequirementRecord,
+    decision: &Decision,
+    has_answers: bool,
+) -> Result<Vec<SourceRef>, &'static str> {
+    if decision.requirement_id() != record.requirement.id {
+        return Err("Copy current_requirement.id exactly into requirement_id.");
+    }
+    match decision {
+        Decision::Assess {
+            assessment,
+            operation,
+            reason,
+            evidence,
+            allowed_case,
+            alternative,
+            margin,
+            ..
+        } => {
+            let refs = materials::resolve_all(&report.blocks, evidence).map_err(
+                |_| "Use a unique, exact quote from the named block for every evidence item.",
+            )?;
+            if operation.trim().is_empty() || reason.trim().is_empty() {
+                return Err("Provide the operation and a reason for the assessment.");
+            }
+            if refs.is_empty()
+                || (refs.iter().all(|s| record.requirement.evidence.contains(s))
+                    && record.facts.is_empty()
+                    && !has_answers)
+            {
+                return Err(INDEPENDENT_BASIS_FEEDBACK);
+            }
+            if *assessment == Assessment::Insufficient
+                && allowed_case.as_ref().is_none_or(|s| s.trim().is_empty())
+            {
+                return Err("Provide the permitted configuration in allowed_case.");
+            }
+            if *assessment == Assessment::PossiblyExcessive
+                && (alternative.as_ref().is_none_or(|s| s.trim().is_empty())
+                    || margin.as_ref().is_none_or(|s| s.trim().is_empty()))
+            {
+                return Err("Provide both a supported alternative and its margin.");
+            }
+            return Ok(refs);
+        }
+        Decision::Ask { fact, question, .. }
+            if fact.trim().is_empty() || question.trim().is_empty() =>
+        {
+            return Err("Give the missing fact and a specific question.");
+        }
+        Decision::Read { block_ids, .. }
+            if block_ids.is_empty()
+                || block_ids
+                    .iter()
+                    .any(|id| !report.blocks.iter().any(|b| b.id == *id)) =>
+        {
+            return Err("List at least one existing block ID for a read.");
+        }
+        Decision::TechnicalFact { target, query, .. }
+            if target.model.trim().is_empty()
+                || target.parameter.trim().is_empty()
+                || query.trim().is_empty() =>
+        {
+            return Err("Specify the model, parameter and search query.");
+        }
+        _ => {}
+    }
+    Ok(vec![])
+}
+
 fn stopped(
     report: &mut QualificationReport,
     requirement: &Requirement,
@@ -246,7 +275,8 @@ async fn find_fact<M: SearchModel, H: HttpTransport>(
     {
         return Ok(Some(fact));
     }
-    work.available()?;
+    let reserved = work.reserved(report);
+    work.available(reserved, false)?;
     let data = serde_json::json!({"target":target,"query":query});
     if data.to_string().len() > work.options.max_context_bytes {
         return Err(FailureReason::ContextLimit);
@@ -256,7 +286,7 @@ async fn find_fact<M: SearchModel, H: HttpTransport>(
         StageRequest::new(StageKind::Search, prompts::SEARCH).field("query", &visibility, &data);
     let search = work
         .runtime
-        .search(work.run, &request, work.options.max_search_turns)
+        .search_with_reserve(work.run, &request, work.options.max_search_turns, reserved)
         .await
         .map_err(FailureReason::from)?;
     report.searches.push(SearchTrace {
@@ -309,6 +339,7 @@ async fn find_fact<M: SearchModel, H: HttpTransport>(
         report.blocks.retain(|b| b.material_id != material.id);
         report.blocks.extend(blocks.clone());
         report.external_sources.push(provenance);
+        update_reservation_record(report, record, work);
         if let Some(fact) = verify(&blocks, target, report, work).await? {
             return Ok(Some(fact));
         }
@@ -336,21 +367,11 @@ async fn verify<M: SearchModel>(
         .filter(|material| blocks.iter().any(|b| b.material_id == material.id))
         .collect();
     let value = serde_json::json!({"target":target,"source_blocks":blocks,"source_origins":origins,"attachments":attachments});
-    let verification: FactVerification = work
-        .call(
-            prompts::VERIFY,
-            &value,
-            &report.visibility(),
-            StageKind::Claims,
-        )
-        .await?;
-    let Some(proposal) = verification.fact else {
-        return Ok(None);
-    };
-    if !verification.primary_source || verification.reason.trim().is_empty() {
-        return Ok(None);
-    }
-    validate_fact(blocks, target, proposal).map(Some)
+    work.call_checked(report, false, prompts::VERIFY, &value, StageKind::Claims, |verification: FactVerification| {
+        let Some(proposal) = verification.fact else {return Ok(None)};
+        if !verification.primary_source || verification.reason.trim().is_empty() {return Ok(None);}
+        validate_fact(blocks, target, proposal).map(Some).map_err(|_| "Cite the exact model, parameter, value, unit and conditions from the same applicable source and table column.")
+    }).await
 }
 
 pub(crate) fn validate_fact(

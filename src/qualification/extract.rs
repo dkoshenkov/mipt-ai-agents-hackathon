@@ -56,63 +56,79 @@ pub(crate) async fn extract<M: Model>(report: &mut QualificationReport, work: &W
         };
         for document in contexts {
             let input = serde_json::json!({"packet": blocks, "specification": document});
-            let result: Result<Extraction, _> = work
-                .call(
-                    prompts::EXTRACT,
-                    &input,
-                    &report.visibility(),
-                    StageKind::Claims,
-                )
-                .await;
-            match result {
-                Ok(extraction) => {
-                    for coverage in &mut report.coverage.blocks {
-                        if ids.contains(&coverage.block_id) {
-                            coverage.extracted = true;
+            let mut accepted = Vec::new();
+            let mut unresolved = Vec::new();
+            let mut rejected = Vec::new();
+            let mut received = false;
+            let extraction_work = Work {
+                runtime: work.runtime,
+                run: work.run,
+                options: work.options,
+                reserve_review: work.reserve_review,
+                remaining_requirements: report.requirements.len(),
+            };
+            let result = extraction_work.call_checked(report, true, prompts::EXTRACT, &input, StageKind::Claims, |extraction: Extraction| {
+                received = true;
+                rejected.clear();
+                for quote in extraction.unresolved {
+                    if materials::resolve(&report.blocks, &quote).is_ok() {
+                        if !unresolved.contains(&quote.block_id) {
+                            unresolved.push(quote.block_id);
                         }
-                    }
-                    for quote in extraction.unresolved {
-                        let reason = if materials::resolve(&report.blocks, &quote).is_ok() {
-                            FailureReason::Unreadable
-                        } else {
-                            FailureReason::InvalidResponse
-                        };
-                        report.gap(vec![quote.block_id], "obligation_scope", reason);
-                    }
-                    for draft in extraction.requirements {
-                        if !draft.evidence.iter().any(|q| ids.contains(&q.block_id)) {
-                            report.gap(ids.clone(), "extract", FailureReason::InvalidResponse);
-                            continue;
-                        }
-                        let id = report.next_id("requirement");
-                        match materials::requirement(report, id, draft) {
-                            Ok(requirement) => {
-                                if report.requirements.iter().any(|r| {
-                                    r.requirement.evidence == requirement.evidence
-                                        && r.requirement.property == requirement.property
-                                        && r.requirement.constraint == requirement.constraint
-                                        && r.requirement.position == requirement.position
-                                        && r.requirement.scope == requirement.scope
-                                }) {
-                                    continue;
-                                }
-                                report.requirements.push(RequirementRecord {
-                                    requirement,
-                                    facts: vec![],
-                                    read_evidence: vec![],
-                                    outcome: RequirementOutcome::Stopped {
-                                        failure: Failure::new(
-                                            "assessment",
-                                            FailureReason::BudgetExhausted,
-                                        ),
-                                    },
-                                });
-                            }
-                            Err(reason) => report.gap(ids.clone(), "extract", reason),
-                        }
+                    } else {
+                        rejected.push(("obligation_scope", vec![quote.block_id]));
                     }
                 }
-                Err(reason) => report.gap(ids.clone(), "extract", reason),
+                for draft in extraction.requirements {
+                    if draft.evidence.iter().any(|q| ids.contains(&q.block_id))
+                        && let Ok(requirement) = materials::requirement(report, String::new(), draft)
+                    {
+                        if !accepted.contains(&requirement) {
+                            accepted.push(requirement);
+                        }
+                    } else {
+                        rejected.push(("extract", ids.clone()));
+                    }
+                }
+                if rejected.is_empty() { Ok(()) } else { Err("Correct the rejected requirements and unresolved quotes. Cite exact text and block IDs within this packet and give the complete extraction.") }
+            }).await;
+            if received {
+                for coverage in &mut report.coverage.blocks {
+                    if ids.contains(&coverage.block_id) {
+                        coverage.extracted = true;
+                    }
+                }
+            }
+            for id in unresolved {
+                report.gap(vec![id], "obligation_scope", FailureReason::Unreadable);
+            }
+            for mut requirement in accepted {
+                if report.requirements.iter().any(|r| {
+                    r.requirement.evidence == requirement.evidence
+                        && r.requirement.property == requirement.property
+                        && r.requirement.constraint == requirement.constraint
+                        && r.requirement.position == requirement.position
+                        && r.requirement.scope == requirement.scope
+                }) {
+                    continue;
+                }
+                requirement.id = report.next_id("requirement");
+                report.requirements.push(RequirementRecord {
+                    requirement,
+                    facts: vec![],
+                    read_evidence: vec![],
+                    outcome: RequirementOutcome::Stopped {
+                        failure: Failure::new("assessment", FailureReason::BudgetExhausted),
+                    },
+                });
+            }
+            if let Err(reason) = result {
+                for (stage, blocks) in &rejected {
+                    report.gap(blocks.clone(), stage, FailureReason::InvalidResponse);
+                }
+                if rejected.is_empty() || reason != FailureReason::InvalidResponse {
+                    report.gap(ids.clone(), "extract", reason);
+                }
             }
         }
     }

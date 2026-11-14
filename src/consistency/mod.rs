@@ -17,6 +17,7 @@ mod table_scope;
 
 use std::{collections::BTreeSet, ops::Range};
 
+use futures::{StreamExt, stream};
 use serde::Serialize;
 
 use crate::{
@@ -296,7 +297,7 @@ async fn analyze<M: Model, T: catalog_http::Transport>(
     let packets = index.packets(options.packet_bytes);
     let mut extracted = ClaimRegistry::default();
     let table_claims = table_rows::claims(index);
-    let mut seen = BTreeSet::new();
+    let equipment_types = table_rows::equipment_type(index);
     let assessment_date = options
         .assessment_date
         .map(str::to_owned)
@@ -342,49 +343,86 @@ async fn analyze<M: Model, T: catalog_http::Transport>(
     for control_pass in [false, true] {
         let initial_registry = extracted.claims().to_vec();
         let mut refinements = Vec::new();
-        let mut queue: std::collections::VecDeque<_> =
-            packets.packets.iter().map(|p| p.subjects.clone()).collect();
-        while let Some(subjects) = queue.pop_front() {
-            let packet = index.packet_for(&subjects);
+        let mut pending: Vec<_> = packets
+            .packets
+            .iter()
+            .rev()
+            .map(|p| p.subjects.as_slice())
+            .collect();
+        let mut next_packet = 0;
+        let pass = if control_pass { "control" } else { "claims" };
+        let reads = std::iter::from_fn(|| {
+            loop {
+                let subjects = pending.pop()?;
+                let packet = index.packet_for(subjects);
+                let control = control_pass.then(|| {
+                    claims::prepare_control(index, &packet, &initial_registry, options.packet_bytes)
+                });
+                if matches!(control, Some(Err(crate::runtime::StepError::Preparation)))
+                    && subjects.len() > 1
+                {
+                    let (left, right) = subjects.split_at(subjects.len() / 2);
+                    pending.extend([right, left]);
+                    continue;
+                }
+                next_packet += 1;
+                use tracing::Instrument;
+                let span = tracing::info_span!(
+                    "consistency_packet",
+                    run_id = run.id(),
+                    pass,
+                    packet = next_packet
+                );
+                return Some(
+                    async move {
+                        let result = match control {
+                            Some(Ok(prepared)) => {
+                                claims::read_control(
+                                    runtime,
+                                    run,
+                                    index,
+                                    document.visibility,
+                                    prepared,
+                                )
+                                .await
+                            }
+                            Some(Err(error)) => Err(error),
+                            None => claims::extract(
+                                runtime,
+                                run,
+                                index,
+                                &packet,
+                                document.visibility,
+                                false,
+                            )
+                            .await
+                            .map(|batch| claims::ControlOutcome {
+                                batch,
+                                ..Default::default()
+                            }),
+                        };
+                        (packet.subjects, result)
+                    }
+                    .instrument(span),
+                );
+            }
+        });
+        let mut reads = stream::iter(reads).buffered(3);
+        let mut completed = 0;
+        while let Some((subjects, result)) = reads.next().await {
             let mut coverage = PacketCoverage {
-                subjects: packet.subjects.clone(),
+                subjects,
                 control_pass,
                 stop: None,
                 binding_issues: Vec::new(),
             };
-            let response = if control_pass {
-                match claims::extract_control(
-                    runtime,
-                    run,
-                    index,
-                    &packet,
-                    document.visibility,
-                    &initial_registry,
-                    options.packet_bytes,
-                )
-                .await
-                {
-                    Ok(outcome) => {
-                        refinements.extend(outcome.refinements);
-                        report
-                            .recovered_standard_mentions
-                            .extend(outcome.standard_mentions);
-                        Ok(outcome.batch)
-                    }
-                    Err(crate::runtime::StepError::Preparation) if subjects.len() > 1 => {
-                        let (left, right) = subjects.split_at(subjects.len() / 2);
-                        queue.push_front(right.to_vec());
-                        queue.push_front(left.to_vec());
-                        continue;
-                    }
-                    Err(error) => Err(error),
-                }
-            } else {
-                claims::extract(runtime, run, index, &packet, document.visibility, false).await
-            };
-            match response {
-                Ok(batch) => {
-                    seen.extend(packet.subjects.iter().copied());
+            match result {
+                Ok(outcome) => {
+                    refinements.extend(outcome.refinements);
+                    report
+                        .recovered_standard_mentions
+                        .extend(outcome.standard_mentions);
+                    let batch = outcome.batch;
                     extracted.insert_batch(batch.claims);
                     for rule in batch.priority_rules {
                         if !report.priority_mentions.contains(&rule) {
@@ -395,6 +433,17 @@ async fn analyze<M: Model, T: catalog_http::Transport>(
                 }
                 Err(reason) => coverage.stop = Some(format!("{reason:?}")),
             }
+            completed += 1;
+            tracing::info!(
+                run_id = run.id(),
+                event = "packet_finished",
+                pass,
+                packet = completed,
+                blocks = coverage.subjects.len(),
+                binding_issues = coverage.binding_issues.len(),
+                stop = coverage.stop.as_deref(),
+                remaining = run.remaining()
+            );
             report.packets.push(coverage);
         }
         let issues = extracted.apply_refinements(refinements);
@@ -411,26 +460,9 @@ async fn analyze<M: Model, T: catalog_http::Transport>(
         // The control packet indexes the model's own extraction. Merge locally verified
         // table facts for comparisons after that pass has resolved those indices.
         let mut registry = extracted.clone();
-        registry.insert_batch(
-            table_claims
-                .iter()
-                .filter(|claim| {
-                    let Constraint::Numeric {
-                        value,
-                        unit: Some(unit),
-                        ..
-                    } = &claim.constraint
-                    else {
-                        return false;
-                    };
-                    [&claim.statement, &claim.property, value, unit]
-                        .into_iter()
-                        .chain(&claim.object.evidence)
-                        .chain(&claim.stage)
-                        .all(|source| seen.contains(&source.evidence.block_id))
-                })
-                .cloned(),
-        );
+        // These facts have already been verified against the local source. A failed model
+        // read still participates in known_gaps and can block a definitive verdict.
+        registry.insert_batch(table_claims.iter().cloned());
         let mut candidates = numeric_candidates(&registry);
         let mut objects = std::collections::BTreeMap::<_, Vec<_>>::new();
         for claim in registry.claims().iter().filter(|c| c.complete) {
@@ -496,6 +528,19 @@ async fn analyze<M: Model, T: catalog_http::Transport>(
             }
             candidates.extend(semantic_cache[&key].iter().cloned());
         }
+        for (typed, _) in &equipment_types {
+            candidates.retain(|c| {
+                !matches!(c.category.as_str(), "semantic" | "naming")
+                    || !typed.evidence.iter().all(|side| {
+                        c.evidence.iter().any(|e| {
+                            e.block_id == side.block_id
+                                && e.range.start < side.range.end
+                                && side.range.start < e.range.end
+                        })
+                    })
+            });
+            candidates.push(typed.clone());
+        }
         candidates.sort_by_key(|c| c.evidence[0].range.start);
         if control_pass {
             final_candidates = candidates;
@@ -515,9 +560,12 @@ async fn analyze<M: Model, T: catalog_http::Transport>(
     scan.mentions.sort_by_key(|m| m.evidence.range.start);
     report.standard_references = catalog.review(&scan, &assessment_date);
     if let Some(client) = live.as_mut() {
+        let mut variant_rows = Vec::new();
         for row in &mut report.standard_references {
             let lookup = client.lookup(document.visibility, &row.mention.key).await;
-            if !lookup.catalog.cards.is_empty() {
+            if matches!(lookup.outcome, catalog_http::Outcome::Found)
+                && !lookup.catalog.cards.is_empty()
+            {
                 let one = standards::Scan {
                     mentions: vec![row.mention.clone()],
                     unread_ranges: vec![],
@@ -532,7 +580,60 @@ async fn analyze<M: Model, T: catalog_http::Transport>(
             }
             report.catalog_trace.push(lookup);
         }
+        for (i, row) in report.standard_references.iter().enumerate() {
+            if matches!(
+                row.existence,
+                standards::Existence::NotFoundInOfficialSearch
+            ) && row.mention.key.year.is_some()
+            {
+                variant_rows.push(i);
+            }
+        }
+        for i in variant_rows {
+            let row = &mut report.standard_references[i];
+            let variants = client
+                .lookup_family_variants(document.visibility, &row.mention.key)
+                .await;
+            if matches!(variants.outcome, catalog_http::Outcome::Found) {
+                let context = index
+                    .source
+                    .get(row.mention.context.range.clone())
+                    .unwrap_or("");
+                for card in &variants.catalog.cards {
+                    if standards::confirmed_family_variant(&row.mention.key, card, context)
+                        && !row
+                            .confirmed_family_variants
+                            .iter()
+                            .any(|v| v.url == card.url)
+                    {
+                        row.confirmed_family_variants.push(card.clone());
+                    }
+                }
+            }
+            report.catalog_trace.push(variants);
+        }
         report.catalog_requests = client.total_requests();
+    }
+    for row in &mut report.standard_references {
+        if matches!(
+            row.existence,
+            standards::Existence::NotFoundInOfficialSearch
+        ) {
+            let context = index
+                .source
+                .get(row.mention.context.range.clone())
+                .unwrap_or("");
+            for card in &catalog.cards {
+                if standards::confirmed_family_variant(&row.mention.key, card, context)
+                    && !row
+                        .confirmed_family_variants
+                        .iter()
+                        .any(|v| v.url == card.url)
+                {
+                    row.confirmed_family_variants.push(card.clone());
+                }
+            }
+        }
     }
     for reference in &report.standard_references {
         report.standard_usage.push(
@@ -585,21 +686,29 @@ async fn analyze<M: Model, T: catalog_http::Transport>(
         candidate
             .known_gaps
             .retain(|id| index.has_readable_text(*id));
-        report.investigations.push(
-            investigate_bounded(
-                runtime,
-                run,
-                index,
-                document.visibility,
-                candidate,
-                if options.allow_read { &allowed } else { &[] },
-                investigation::InvestigationLimits {
-                    read_bytes: options.read_bytes,
-                    context_bytes: Some(options.packet_bytes),
-                },
-            )
-            .await,
-        );
+        let comparison = if candidate.category == "numeric" {
+            table_rows::nominal_comparison(&candidate, &report.claims)
+        } else {
+            equipment_types
+                .iter()
+                .find(|(t, _)| t.id == candidate.id)
+                .map(|(_, s)| s.clone())
+        };
+        let mut investigation = investigate_bounded(
+            runtime,
+            run,
+            index,
+            document.visibility,
+            candidate,
+            if options.allow_read { &allowed } else { &[] },
+            investigation::InvestigationLimits {
+                read_bytes: options.read_bytes,
+                context_bytes: Some(options.packet_bytes),
+            },
+        )
+        .await;
+        investigation.source_comparison = comparison;
+        report.investigations.push(investigation);
     }
     for claim in &report.claims {
         if claim.object.key.is_none() && claim.object.alternatives.len() >= 2 {

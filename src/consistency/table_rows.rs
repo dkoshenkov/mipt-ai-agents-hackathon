@@ -1,10 +1,12 @@
 use super::{
     claims::{Claim, Constraint, Grounded, Object, Operator},
-    markdown::MarkdownIndex,
+    investigation::{Candidate, SourceComparison},
+    markdown::{BlockKind, MarkdownIndex},
     numeric::{parse_decimal, parse_unit},
     table_measure::work_measure,
     table_scope::{characteristic_owner, text, work_owner},
 };
+use sha2::{Digest, Sha256};
 
 fn subquote(index: &MarkdownIndex, cell: &Grounded, literal: &str) -> Option<Grounded> {
     Some(Grounded {
@@ -48,9 +50,7 @@ fn qualified(label: &str) -> bool {
         })
 }
 
-// Only an explicit measurement can establish a nominal. The row number and the work
-// quantity have their own columns and never participate in this lookup.
-fn characteristic(index: &MarkdownIndex, value_id: usize) -> Option<Claim> {
+fn plain_requirement_row(index: &MarkdownIndex, value_id: usize) -> Option<()> {
     let position = index.blocks[value_id].table.as_ref()?;
     if position.rows.len() != 1
         || position.columns.len() != 1
@@ -67,6 +67,21 @@ fn characteristic(index: &MarkdownIndex, value_id: usize) -> Option<Claim> {
     {
         return None;
     }
+    if index.blocks[value_id]
+        .table_context
+        .iter()
+        .filter_map(|id| text(index, *id))
+        .any(|cell| cell.text.to_lowercase().starts_with("примечан"))
+    {
+        return None;
+    }
+    Some(())
+}
+
+// Only an explicit measurement can establish a nominal. The row number and the work
+// quantity have their own columns and never participate in this lookup.
+fn characteristic(index: &MarkdownIndex, value_id: usize) -> Option<Claim> {
+    plain_requirement_row(index, value_id)?;
     let statement = text(index, value_id)?;
     let raw = statement.text.as_str();
     let split = raw.find(char::is_alphabetic).unwrap_or(raw.len());
@@ -145,16 +160,163 @@ fn characteristic(index: &MarkdownIndex, value_id: usize) -> Option<Claim> {
     {
         return None;
     }
-    if index.blocks[value_id]
-        .table_context
-        .iter()
-        .filter_map(|id| text(index, *id))
-        .any(|cell| cell.text.to_lowercase().starts_with("примечан"))
-    {
-        return None;
-    }
     let owner = owner.or_else(|| characteristic_owner(index, value_id))?;
     Some(nominal(statement, owner, property?, value, unit, None))
+}
+
+// Match a single explicit type in a supply table with an explicit description of the
+// new object. A reference to the equipment being removed cannot establish its successor's type.
+pub(super) fn equipment_type(index: &MarkdownIndex) -> Vec<(Candidate, SourceComparison)> {
+    let mut comparisons = Vec::new();
+    for block in &index.blocks {
+        let Some(property) = block.table.as_ref().and_then(|_| text(index, block.id)) else {
+            continue;
+        };
+        let label = property.text.to_lowercase();
+        let Some(owner_name) = label
+            .strip_prefix("тип ")
+            .or_else(|| label.strip_prefix("вид "))
+        else {
+            continue;
+        };
+        let Some(object) = characteristic_owner(index, block.id) else {
+            continue;
+        };
+        if object.key.as_deref() != Some(owner_name)
+            || !matches!(
+                column(index, block.id).as_deref(),
+                Some(
+                    "параметр"
+                        | "наименование оборудования"
+                        | "характеристика"
+                        | "наименование характеристики"
+                )
+            )
+        {
+            continue;
+        }
+        let mut values = index.same_row_ids(block.id).into_iter().filter(|&id| {
+            matches!(
+                column(index, id).as_deref(),
+                Some("значение" | "технические характеристики")
+            )
+        });
+        let Some(value_id) = values.next() else {
+            continue;
+        };
+        if values.next().is_some() || plain_requirement_row(index, value_id).is_none() {
+            continue;
+        }
+        let Some(value) = text(index, value_id) else {
+            continue;
+        };
+        if !value.text.chars().all(char::is_alphabetic) {
+            continue;
+        }
+        let descriptions: Vec<_> = index
+            .blocks
+            .iter()
+            .filter(|b| b.kind == BlockKind::Paragraph && b.id < block.id)
+            .filter_map(|b| {
+                let source = text(index, b.id)?;
+                let words: Vec<_> = source.text.split_whitespace().collect();
+                let [state, kind, noun, verb, ..] = words.as_slice() else {
+                    return None;
+                };
+                let subject = noun.to_lowercase();
+                let same_noun = subject == owner_name
+                    || ["а", "я"]
+                        .iter()
+                        .any(|ending| owner_name.strip_suffix(ending) == Some(&subject));
+                if !matches!(state.to_lowercase().as_str(), "новый" | "новая" | "новое")
+                    || !matches!(
+                        verb.to_lowercase().as_str(),
+                        "устанавливается" | "поставляется"
+                    )
+                    || !kind.chars().all(char::is_alphabetic)
+                    || !same_noun
+                    || qualified(&source.text)
+                {
+                    return None;
+                }
+                let kind = kind.to_string();
+                Some((source, kind, subject))
+            })
+            .collect();
+        let [(description, kind, subject)] = descriptions.as_slice() else {
+            continue;
+        };
+        if kind.to_lowercase() == value.text.to_lowercase() {
+            continue;
+        }
+        let sides = [description.evidence.clone(), value.evidence];
+        let id = serde_json::to_vec(&("equipment_type", &sides)).expect("serializable evidence");
+        let candidate = Candidate {
+            id: format!("{:x}", Sha256::digest(id)),
+            category: "naming".into(),
+            object: subject.clone(),
+            property: property.text.clone(),
+            evidence: sides.to_vec(),
+            context: object
+                .evidence
+                .into_iter()
+                .map(|g| g.evidence)
+                .chain([property.evidence])
+                .collect(),
+            known_gaps: vec![],
+        };
+        let question = format!(
+            "{} — «{}» или «{}»? Уточните, какой тип требуется к поставке.",
+            property.text, kind, value.text
+        );
+        comparisons.push((candidate, SourceComparison { sides, question }));
+    }
+    comparisons
+}
+
+pub(super) fn nominal_comparison(
+    candidate: &Candidate,
+    claims: &[Claim],
+) -> Option<SourceComparison> {
+    let mut seen = Vec::<(&Claim, &Grounded, &Grounded)>::new();
+    for claim in claims {
+        if !claim.complete
+            || claim.object.key.as_deref() != Some(&candidate.object)
+            || claim.property.text.to_lowercase() != candidate.property
+            || !candidate.evidence.contains(&claim.statement.evidence)
+        {
+            continue;
+        }
+        let Constraint::Numeric {
+            operator: Operator::Exact | Operator::TableNominal,
+            value,
+            unit: Some(unit),
+            ..
+        } = &claim.constraint
+        else {
+            continue;
+        };
+        for &(other, prior, prior_unit) in &seen {
+            if claim.statement.evidence == other.statement.evidence
+                || matches!((&other.stage, &claim.stage), (Some(a), Some(b)) if a.text.to_lowercase() != b.text.to_lowercase())
+                || super::numeric::hypotheses(&[other, claim]).is_empty()
+            {
+                continue;
+            }
+            return Some(SourceComparison {
+                sides: [
+                    other.statement.evidence.clone(),
+                    claim.statement.evidence.clone(),
+                ],
+                question: format!(
+                    "Какое значение требуется для «{}» — {} {} или {} {}?",
+                    claim.property.text, prior.text, prior_unit.text, value.text, unit.text
+                ),
+            });
+        }
+        seen.push((claim, value, unit));
+    }
+    None
 }
 
 fn nominal(

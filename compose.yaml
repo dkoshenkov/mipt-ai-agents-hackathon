@@ -1,0 +1,39 @@
+services:
+  ui:
+    image: ${IMAGE_PREFIX:-mipt-review}-ui:${IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: docker/ui/Dockerfile
+    ports:
+      - "127.0.0.1:${UI_PORT:-8711}:8080"
+    depends_on:
+      - backend
+  backend:
+    image: ${IMAGE_PREFIX:-mipt-review}-backend:${IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: docker/rust/Dockerfile
+    environment:
+      REVIEW_BIND: 0.0.0.0:8710
+      DOCX_MODEL_URL: http://model:8000/convert
+      XAI_API_KEY: ${XAI_API_KEY:-}
+      XAI_WORKER_MODEL: ${XAI_WORKER_MODEL:-grok-4.20-0309-non-reasoning}
+      XAI_CRITIC_MODEL: ${XAI_CRITIC_MODEL:-grok-4.20-0309-reasoning}
+      XAI_REVIEWER_MODEL: ${XAI_REVIEWER_MODEL:-}
+      TZ_REVIEW_BUDGET: ${TZ_REVIEW_BUDGET:-7}
+    depends_on:
+      model:
+        condition: service_healthy
+  model:
+    image: ${IMAGE_PREFIX:-mipt-review}-model:${IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: docker/model/Dockerfile
+    volumes:
+      - ./target/mineru:/models
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/health', timeout=4)"]
+      start_period: 30m
+      interval: 15s
+      timeout: 5s
+      retries: 3

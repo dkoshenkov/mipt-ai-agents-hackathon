@@ -14,39 +14,75 @@ pub(crate) async fn review<W: SearchModel, R: Model, H: HttpTransport>(
     reviewer: &Runtime<R>,
     sources: &mut SourceSession<'_, H>,
 ) {
-    let original_ids: Vec<_> = report
-        .coverage
-        .blocks
-        .iter()
-        .map(|b| b.block_id.clone())
-        .collect();
-    let payload = serde_json::json!({"document_id":report.document_id,"original_blocks":original_ids,
-        "blocks":report.blocks,"materials":report.materials,"records":report.requirements,
-        "clarifications":report.clarifications,"source_origins":report.external_sources,"coverage":report.coverage});
-    let review_work = Work {
-        runtime: reviewer,
-        run: worker.run,
-        options: worker.options,
-        reserve_review: false,
+    let packets = review_packets(report, worker.options);
+    let total = packets.len();
+    let mut combined = ReviewResponse {
+        notes: vec![],
+        blocks: vec![],
     };
-    let response: ReviewResponse = match review_work
-        .call(
-            prompts::REVIEW,
-            &payload,
-            &report.visibility(),
-            StageKind::Review,
-        )
-        .await
-    {
-        Ok(result) => result,
-        Err(reason) => {
-            report.coverage.review = ReviewStatus::Failed {
-                failure: Failure::new("final_review", reason.clone()),
-            };
-            report.gap(original_ids, "final_review", reason);
-            return;
+    let mut failures = Vec::new();
+    for (index, (ids, split, fits)) in packets.iter().cloned().enumerate() {
+        let review_work = Work {
+            runtime: reviewer,
+            run: worker.run,
+            options: worker.options,
+            reserve_review: false,
+            remaining_requirements: packets[index + 1..]
+                .iter()
+                .filter(|(_, _, fits)| *fits)
+                .count(),
+        };
+        tracing::info!(
+            run_id = worker.run.id(),
+            stage = "final_review",
+            event = "packet_started",
+            packet = index + 1,
+            total_packets = total,
+            blocks = ids.len(),
+            remaining = worker.run.remaining()
+        );
+        let payload = review_payload(report, &ids, split);
+        let result = if fits {
+            review_work.call_checked(
+                report, true, prompts::REVIEW, &payload, StageKind::Review,
+                |mut part: ReviewResponse| {
+                    if split && !scope_response(&mut part, &ids, &payload, combined.blocks.len()) {
+                        return Err("Reconcile the assigned original_blocks exactly once. Use only the records and evidence from this packet.");
+                    }
+                    Ok(part)
+                },
+            ).await
+        } else {
+            Err(FailureReason::ContextLimit)
+        };
+        match result {
+            Ok(mut part) => {
+                tracing::info!(
+                    run_id = worker.run.id(),
+                    stage = "final_review",
+                    event = "packet_received",
+                    packet = index + 1,
+                    total_packets = total,
+                    remaining = worker.run.remaining(),
+                    received_blocks = combined.blocks.len() + part.blocks.len()
+                );
+                combined.notes.append(&mut part.notes);
+                combined.blocks.append(&mut part.blocks);
+            }
+            Err(reason) => failures.push((ids, reason)),
         }
-    };
+    }
+    // Reconciliation and edits are one transaction across all original blocks.
+    if let Some((_, reason)) = failures.first() {
+        report.coverage.review = ReviewStatus::Failed {
+            failure: Failure::new("final_review", reason.clone()),
+        };
+        for (ids, reason) in failures {
+            report.gap(ids, "final_review", reason);
+        }
+        return;
+    }
+    let response = combined;
     report.coverage.review = ReviewStatus::Completed;
     let mut note_counts = HashMap::new();
     let mut target_counts = HashMap::new();
@@ -61,6 +97,7 @@ pub(crate) async fn review<W: SearchModel, R: Model, H: HttpTransport>(
         run: worker.run,
         options: worker.options,
         reserve_review: false,
+        remaining_requirements: 0,
     };
     let original_requirements = report.requirements.clone();
     let closed_questions = report.closed_questions.len();
@@ -104,6 +141,9 @@ pub(crate) async fn review<W: SearchModel, R: Model, H: HttpTransport>(
     }
     sort_records(report);
     if !reconcile(report, response.blocks) {
+        report.coverage.review = ReviewStatus::Failed {
+            failure: Failure::new("reconcile", FailureReason::InvalidResponse),
+        };
         // Notes and their block mappings form one change; reject it without losing prior records.
         report.requirements = original_requirements;
         report.closed_questions.truncate(closed_questions);
@@ -115,6 +155,198 @@ pub(crate) async fn review<W: SearchModel, R: Model, H: HttpTransport>(
             block.reviewed = false;
         }
     }
+}
+
+// Use the same byte accounting and splitting for reservation and dispatch.
+fn review_packets(
+    report: &QualificationReport,
+    options: &QualificationOptions,
+) -> Vec<(Vec<String>, bool, bool)> {
+    let ids: Vec<_> = report
+        .coverage
+        .blocks
+        .iter()
+        .map(|b| b.block_id.clone())
+        .collect();
+    let mut pending = vec![(ids, false)];
+    let mut packets = Vec::new();
+    let schema_len = schemars::schema_for!(ReviewResponse)
+        .as_value()
+        .to_string()
+        .len();
+    while let Some((ids, split)) = pending.pop() {
+        let payload = review_payload(report, &ids, split);
+        let fits = serde_json::to_vec(&payload)
+            .map(|v| v.len().saturating_add(schema_len) <= options.max_context_bytes)
+            .unwrap_or(false);
+        if !fits && ids.len() > 1 {
+            let mid = ids.len() / 2;
+            pending.push((ids[mid..].to_vec(), true));
+            pending.push((ids[..mid].to_vec(), true));
+        } else {
+            packets.push((ids, split, fits));
+        }
+    }
+    packets
+}
+
+pub(super) fn packet_count(report: &QualificationReport, options: &QualificationOptions) -> usize {
+    review_packets(report, options)
+        .iter()
+        .filter(|(_, _, fits)| *fits)
+        .count()
+}
+
+/// Each requirement belongs to its first evidence block. Related quotes travel with it,
+/// including references into attachments and source material from outside the packet.
+fn review_payload(report: &QualificationReport, ids: &[String], split: bool) -> serde_json::Value {
+    let subjects: HashSet<_> = ids.iter().map(String::as_str).collect();
+    let mut context = subjects.clone();
+    let records: Vec<_> = report
+        .requirements
+        .iter()
+        .filter(|r| {
+            !split
+                || r.requirement
+                    .evidence
+                    .first()
+                    .is_some_and(|e| subjects.contains(e.block_id.as_str()))
+        })
+        .collect();
+    for r in &records {
+        let outcome_evidence = match &r.outcome {
+            RequirementOutcome::Assessed { evidence, .. } => evidence.as_slice(),
+            _ => &[],
+        };
+        for source in r
+            .requirement
+            .evidence
+            .iter()
+            .chain(&r.requirement.reference)
+            .chain(&r.read_evidence)
+            .chain(r.facts.iter().flat_map(|fact| &fact.evidence))
+            .chain(outcome_evidence)
+        {
+            context.insert(source.block_id.as_str());
+        }
+    }
+    let blocks: Vec<_> = report
+        .blocks
+        .iter()
+        .filter(|b| !split || context.contains(b.id.as_str()))
+        .collect();
+    let clarifications: Vec<_> = report
+        .clarifications
+        .iter()
+        .filter(|c| !split || records.iter().any(|r| r.requirement.id == c.requirement_id))
+        .collect();
+    let mut payload = serde_json::json!({"document_id":report.document_id,"original_blocks":ids,
+        "blocks":blocks,"materials":report.materials,"records":records,
+        "clarifications":clarifications,"source_origins":report.external_sources});
+    if split {
+        payload["packet"] = true.into();
+        payload["gaps"] = serde_json::json!(
+            report
+                .coverage
+                .gaps
+                .iter()
+                .filter_map(|g| {
+                    let block_ids: Vec<_> = g
+                        .block_ids
+                        .iter()
+                        .filter(|id| subjects.contains(id.as_str()))
+                        .collect();
+                    (g.block_ids.is_empty() || !block_ids.is_empty()).then(|| {
+                        serde_json::json!({
+                            "block_ids":block_ids, "material_id":g.material_id, "failure":g.failure
+                        })
+                    })
+                })
+                .collect::<Vec<_>>()
+        );
+        payload["unextracted_blocks"] = serde_json::json!(
+            report
+                .coverage
+                .blocks
+                .iter()
+                .filter(|b| !b.extracted && subjects.contains(b.block_id.as_str()))
+                .map(|b| &b.block_id)
+                .collect::<Vec<_>>()
+        );
+    } else {
+        payload["coverage"] = serde_json::json!(report.coverage);
+    }
+    payload
+}
+
+fn scope_response(
+    part: &mut ReviewResponse,
+    ids: &[String],
+    payload: &serde_json::Value,
+    offset: usize,
+) -> bool {
+    let assigned: HashSet<_> = ids.iter().map(String::as_str).collect();
+    let returned: HashSet<_> = part.blocks.iter().map(|b| b.block_id.as_str()).collect();
+    if part.blocks.len() != ids.len() || returned != assigned {
+        return false;
+    }
+    let visible: HashSet<_> = payload["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|b| b["id"].as_str())
+        .collect();
+    let owned: HashSet<_> = payload["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["requirement"]["id"].as_str())
+        .collect();
+    let local_quote = |q: &Quote| visible.contains(q.block_id.as_str());
+    for note in &part.notes {
+        if note.id.trim().is_empty()
+            || !note
+                .evidence
+                .iter()
+                .any(|q| assigned.contains(q.block_id.as_str()))
+            || !note.evidence.iter().all(local_quote)
+            || targets(&note.change)
+                .iter()
+                .any(|id| !owned.contains(id.as_str()))
+        {
+            return false;
+        }
+        if let ReviewChange::Add { requirement } | ReviewChange::Merge { requirement, .. } =
+            &note.change
+            && !requirement
+                .evidence
+                .iter()
+                .chain(&requirement.reference)
+                .all(local_quote)
+        {
+            return false;
+        }
+    }
+    // The model chooses note IDs independently for each packet.
+    let scope = |id: &str| format!("packet-{offset}/{id}");
+    for note in &mut part.notes {
+        note.id = scope(&note.id);
+    }
+    for row in &mut part.blocks {
+        for condition in &mut row.conditions {
+            if condition
+                .requirement_id
+                .as_ref()
+                .is_some_and(|id| !owned.contains(id.as_str()))
+            {
+                return false;
+            }
+            if let Some(id) = &mut condition.note_id {
+                *id = scope(id);
+            }
+        }
+    }
+    true
 }
 
 fn targets(change: &ReviewChange) -> Vec<String> {

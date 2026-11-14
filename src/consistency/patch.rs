@@ -817,6 +817,7 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(id, (a, b))| Investigation {
+                source_comparison: None,
                 candidate: Candidate {
                     id: id.to_string(),
                     category: "numeric".into(),

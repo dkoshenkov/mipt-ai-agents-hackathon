@@ -220,4 +220,57 @@ mod tests {
         assert_eq!(records[2]["fields"]["id"], "");
         assert_eq!(records[3]["fields"]["status"], "rate_limit");
     }
+    #[test]
+    fn typed_finish_logs_the_actual_attempt_on_success_and_failure() {
+        use crate::core::ErrorCategory;
+        use crate::runtime::{ReviewRun, Runtime, StageKind, StageRequest, grok::Model};
+        struct Mock(bool);
+        impl Model for Mock {
+            async fn complete(&self, _: &str) -> Result<String, ErrorCategory> {
+                if self.0 {
+                    Ok("[]".into())
+                } else {
+                    Err(ErrorCategory::Provider)
+                }
+            }
+        }
+        let output = Buffer::default();
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(move || writer.clone())
+                .with_filter(super::filter()),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                for successful in [true, false] {
+                    let model = Runtime::new(Mock(successful), std::time::Duration::from_secs(1));
+                    let request = StageRequest::new(StageKind::Claims, "instruction");
+                    let _: Result<Vec<()>, _> = model.step(&ReviewRun::new(1), &request).await;
+                }
+            });
+        });
+        let output = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        let records: Vec<serde_json::Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let finishes: Vec<_> = records
+            .iter()
+            .filter(|record| record["fields"]["event"] == "finish")
+            .collect();
+        assert_eq!(finishes.len(), 2);
+        assert_eq!(finishes[0]["fields"]["status"], "decoded");
+        assert_eq!(finishes[1]["fields"]["status"], "provider_error");
+        assert!(
+            finishes
+                .iter()
+                .all(|record| record["fields"]["attempt"] == 1)
+        );
+    }
 }

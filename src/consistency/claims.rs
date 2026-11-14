@@ -776,21 +776,37 @@ pub async fn extract_control<M: crate::runtime::grok::Model>(
     existing: &[Claim],
     max_bytes: usize,
 ) -> Result<ControlOutcome, crate::runtime::StepError> {
-    use crate::runtime::{StageKind, StageRequest, StepError};
+    let prepared = prepare_control(index, packet, existing, max_bytes)?;
+    read_control(runtime, run, index, visibility, prepared).await
+}
+
+pub(super) struct ControlPacket<'a> {
+    packet: super::batches::Packet<'a>,
+    scoped: Vec<&'a Claim>,
+}
+
+fn linked_subjects(index: &MarkdownIndex, subjects: &[usize], claim: &Claim) -> Vec<usize> {
+    subjects
+        .iter()
+        .copied()
+        .filter(|&id| {
+            id > claim.statement.evidence.block_id
+                && index.resolve(id, &claim.statement.text).is_some()
+        })
+        .collect()
+}
+
+pub(super) fn prepare_control<'a>(
+    index: &'a MarkdownIndex,
+    packet: &super::batches::Packet<'_>,
+    existing: &'a [Claim],
+    max_bytes: usize,
+) -> Result<ControlPacket<'a>, crate::runtime::StepError> {
+    use crate::runtime::StepError;
     if packet.version != index.version {
         return Err(StepError::Preparation);
     }
-    let linked = |claim: &Claim| -> Vec<usize> {
-        packet
-            .subjects
-            .iter()
-            .copied()
-            .filter(|&id| {
-                id > claim.statement.evidence.block_id
-                    && index.resolve(id, &claim.statement.text).is_some()
-            })
-            .collect()
-    };
+    let linked = |claim| linked_subjects(index, &packet.subjects, claim);
     let scoped: Vec<_> = existing
         .iter()
         .filter(|c| {
@@ -805,7 +821,7 @@ pub async fn extract_control<M: crate::runtime::grok::Model>(
             .map(|c| c.statement.evidence.block_id),
     );
     let mut augmented = index.packet_for(&ids);
-    augmented.subjects = packet.subjects.clone();
+    augmented.subjects.clone_from(&packet.subjects);
     if serde_json::to_vec(&(&augmented, &scoped))
         .map_err(|_| StepError::Preparation)?
         .len()
@@ -813,6 +829,21 @@ pub async fn extract_control<M: crate::runtime::grok::Model>(
     {
         return Err(StepError::Preparation);
     }
+    Ok(ControlPacket {
+        packet: augmented,
+        scoped,
+    })
+}
+
+pub(super) async fn read_control<M: crate::runtime::grok::Model>(
+    runtime: &crate::runtime::Runtime<M>,
+    run: &crate::runtime::ReviewRun,
+    index: &MarkdownIndex,
+    visibility: crate::core::Visibility,
+    prepared: ControlPacket<'_>,
+) -> Result<ControlOutcome, crate::runtime::StepError> {
+    use crate::runtime::{StageKind, StageRequest};
+    let ControlPacket { packet, scoped } = prepared;
     let sources = [visibility];
     let request = StageRequest::new(StageKind::Control, concat!(
         "Independently read every subject block, including text before headings. ",
@@ -825,9 +856,9 @@ pub async fn extract_control<M: crate::runtime::grok::Model>(
         "Refine only when the text supports a correction to object, condition, or eligibility. ",
         "A subject may quote an earlier statement verbatim and specify a correction: cite the earlier statement and quote the corrected object or condition in that subject. ",
         "List omitted standard mentions as quotes. Do not invent facts or use context blocks as subjects."
-    )).schema(strict_schema::<ControlResponse>()).field("packet", &sources, &augmented).field("existing_claims", &sources, &scoped);
+    )).schema(strict_schema::<ControlResponse>()).field("packet", &sources, &packet).field("existing_claims", &sources, &scoped);
     let response: ControlResponse = runtime.step(run, &request).await?;
-    let trusted: Vec<_> = augmented.blocks.iter().map(|b| b.id).collect();
+    let trusted: Vec<_> = packet.blocks.iter().map(|b| b.id).collect();
     let mut result = ControlOutcome::default();
     let mut claims = Vec::new();
     for claim in response.claims {
@@ -863,7 +894,7 @@ pub async fn extract_control<M: crate::runtime::grok::Model>(
             });
             continue;
         };
-        let links = linked(target);
+        let links = linked_subjects(index, &packet.subjects, target);
         let mut validated = validate_batch_linked(
             index,
             &trusted,

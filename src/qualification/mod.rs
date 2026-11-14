@@ -24,22 +24,38 @@ pub(crate) struct Work<'a, M> {
     pub run: &'a ReviewRun,
     pub options: &'a QualificationOptions,
     pub reserve_review: bool,
+    pub remaining_requirements: usize,
 }
 impl<M: Model> Work<'_, M> {
-    fn available(&self) -> Result<(), FailureReason> {
-        if self.run.remaining() <= usize::from(self.reserve_review) {
+    fn reserved(&self, report: &QualificationReport) -> usize {
+        self.remaining_requirements
+            .saturating_add(if self.reserve_review {
+                review::packet_count(report, self.options)
+            } else {
+                0
+            })
+    }
+    fn available(&self, reserved: usize, first: bool) -> Result<(), FailureReason> {
+        let reserved = if first {
+            reserved.saturating_sub(self.remaining_requirements)
+        } else {
+            reserved
+        };
+        if self.run.remaining() <= reserved {
             Err(FailureReason::BudgetExhausted)
         } else {
             Ok(())
         }
     }
-    pub(crate) async fn call<T: DeserializeOwned + schemars::JsonSchema>(
+    pub(crate) async fn call_checked<T: DeserializeOwned + schemars::JsonSchema, U>(
         &self,
+        report: &QualificationReport,
+        first: bool,
         instruction: &'static str,
         value: &(impl Serialize + Sync),
-        visibility: &[crate::core::Visibility],
         kind: StageKind,
-    ) -> Result<T, FailureReason> {
+        mut validate: impl FnMut(T) -> Result<U, &'static str>,
+    ) -> Result<U, FailureReason> {
         let schema = schemars::schema_for!(T);
         if serde_json::to_vec(value)
             .map_err(|_| FailureReason::Preparation)?
@@ -49,18 +65,44 @@ impl<M: Model> Work<'_, M> {
         {
             return Err(FailureReason::ContextLimit);
         }
-        self.available()?;
+        let reserved = self.reserved(report);
+        self.available(reserved, first)?;
+        tracing::info!(
+            run_id = self.run.id(),
+            event = "budget",
+            remaining = self.run.remaining(),
+            reserved,
+            remaining_requirements = self.remaining_requirements
+        );
+        let visibility = report.visibility();
         let request = StageRequest::new(kind, instruction)
-            .field("input", visibility, value)
+            .field("input", &visibility, value)
             .field(
                 "expected_response",
                 &[crate::core::Visibility::Public],
                 &schema,
             );
-        self.runtime
-            .step(self.run, &request)
+        self.run
+            .retry_invalid(
+                reserved,
+                |reason| {
+                    if reason == Some(assessment::INDEPENDENT_BASIS_FEEDBACK) {
+                        1
+                    } else {
+                        3
+                    }
+                },
+                |feedback| {
+                    self.runtime
+                        .step_once_with_reserve(self.run, &request, feedback, reserved)
+                },
+                |result| {
+                    let value =
+                        result.map_err(|e| (FailureReason::from(e), e.invalid_feedback()))?;
+                    validate(value).map_err(|detail| (FailureReason::InvalidResponse, Some(detail)))
+                },
+            )
             .await
-            .map_err(Into::into)
     }
 }
 
@@ -84,12 +126,18 @@ pub async fn review_equipment_adequacy<W: SearchModel, R: Model, H: HttpTranspor
         run: &run,
         options,
         reserve_review: true,
+        remaining_requirements: 0,
     };
     extract::extract(&mut report, &work).await;
     for i in 0..report.requirements.len() {
-        let mut record = report.requirements.remove(i);
-        assessment::assess(&mut report, &mut record, &work, &mut session).await;
-        report.requirements.insert(i, record);
+        let mut record = report.requirements[i].clone();
+        let assessment_work = Work {
+            remaining_requirements: report.requirements.len() - i - 1,
+            ..work
+        };
+        tracing::info!(run_id = run.id(), event = "requirement", requirement = i + 1, total = report.requirements.len(), requirement_id = %record.requirement.id, remaining = run.remaining());
+        assessment::assess(&mut report, &mut record, &assessment_work, &mut session).await;
+        report.requirements[i] = record;
     }
     review::review(&mut report, &work, reviewer, &mut session).await;
     report.model_attempts = run.attempts();

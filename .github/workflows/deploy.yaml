@@ -1,0 +1,76 @@
+name: Build and deploy to VK Cloud
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: vk-cloud-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_PREFIX: ghcr.io/${{ github.repository }}
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build and publish all three images
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker compose build --push
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    env:
+      VK_SSH_TARGET: ${{ vars.VK_SSH_TARGET }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Configure SSH
+        env:
+          VK_SSH_KEY: ${{ secrets.VK_SSH_KEY }}
+          VK_KNOWN_HOSTS: ${{ vars.VK_KNOWN_HOSTS }}
+        run: |
+          : "${VK_SSH_TARGET:?Set VK_SSH_TARGET}" "${VK_SSH_KEY:?Set VK_SSH_KEY}" "${VK_KNOWN_HOSTS:?Set VK_KNOWN_HOSTS}"
+          install -d -m 700 ~/.ssh
+          umask 077
+          printf '%s\n' "$VK_SSH_KEY" > ~/.ssh/vk_deploy
+          printf '%s\n' "$VK_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          cat >> ~/.ssh/config <<EOF
+          Host vk-deploy
+            HostName ${VK_SSH_TARGET#*@}
+            User ${VK_SSH_TARGET%@*}
+            IdentityFile ~/.ssh/vk_deploy
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            BatchMode yes
+            ConnectTimeout 15
+          EOF
+      - name: Deploy the built revision
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          ssh vk-deploy 'mkdir -p ~/mipt-ai-agents-hackathon'
+          scp compose.yaml scripts/deploy-vk.sh vk-deploy:mipt-ai-agents-hackathon/
+          printf '%s' "$REGISTRY_TOKEN" | ssh vk-deploy \
+            "cd ~/mipt-ai-agents-hackathon && sudo -n bash deploy-vk.sh '$IMAGE_PREFIX' '$IMAGE_TAG' '$GITHUB_ACTOR'"

@@ -106,21 +106,33 @@ impl<M: Model> Runtime<M> {
             .map_err(|error| error.category)
     }
 
-    async fn decode_request<T: DeserializeOwned>(
+    pub(super) async fn decode_request<T: DeserializeOwned>(
         &self,
         model: &M,
         prompt: &str,
         schema: Option<&schemars::Schema>,
         check_input: Option<CheckInput<'_>>,
     ) -> Result<T, RequestError> {
+        self.decode_request_retryable(model, prompt, schema, check_input)
+            .await
+            .map_err(|error| error.error)
+    }
+
+    pub(super) async fn decode_request_retryable<T: DeserializeOwned>(
+        &self,
+        model: &M,
+        prompt: &str,
+        schema: Option<&schemars::Schema>,
+        check_input: Option<CheckInput<'_>>,
+    ) -> Result<T, grok::RetryError> {
         let complete = async {
             if let Some(input) = check_input {
-                return model.complete_check_detailed(input).await;
+                return model
+                    .complete_check_detailed(input)
+                    .await
+                    .map_err(grok::RetryError::from);
             }
-            match schema {
-                Some(schema) => model.complete_structured_detailed(prompt, schema).await,
-                None => model.complete_detailed(prompt).await,
-            }
+            model.complete_retryable(prompt, schema).await
         };
         let result = match tokio::time::timeout(self.timeout, complete).await {
             Ok(Ok(response)) => serde_json::from_str(json_body(&response)).map_err(|error| {
@@ -136,15 +148,18 @@ impl<M: Model> Runtime<M> {
                         response.len()
                     ),
                 )
+                .into()
             }),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(RequestError::new(
                 ErrorCategory::TimedOut,
                 "timeout",
                 format!("Request exceeded {} ms", self.timeout.as_millis()),
-            )),
+            )
+            .into()),
         };
-        if let Err(error) = &result {
+        if let Err(detail) = &result {
+            let error = &detail.error;
             tracing::warn!(model = model.name().unwrap_or(""), stage = %error.stage, reason = %error.reason, http_status = error.http_status, category = ?error.category, "request_failed");
         }
         result

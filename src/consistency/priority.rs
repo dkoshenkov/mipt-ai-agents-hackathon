@@ -721,6 +721,7 @@ mod tests {
             known_gaps: vec![],
         };
         let inv = Investigation {
+            source_comparison: None,
             candidate,
             critic_calls: 1,
             read_decisions: vec![],
@@ -1063,6 +1064,7 @@ mod tests {
             ),
         ];
         let inv = Investigation {
+            source_comparison: None,
             candidate: Candidate {
                 id: "range".into(),
                 category: "numeric".into(),
@@ -1514,6 +1516,7 @@ mod tests {
             claim(1, "новое лифт масса ровно 500 кг", "500"),
         ];
         let inv = Investigation {
+            source_comparison: None,
             candidate: Candidate {
                 id: "dated".into(),
                 category: "numeric".into(),

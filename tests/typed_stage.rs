@@ -199,3 +199,34 @@ async fn rejects_all_restricted_sources_before_serializing_any_field() {
     );
     assert_eq!(prompts.lock().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn indexed_document_is_the_same_prefix_for_worker_and_critic() {
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let runtime = Runtime::new(LocalModel(prompts.clone()), Duration::from_secs(1));
+    let run = ReviewRun::new(2);
+    for (kind, instruction, stage) in [
+        (StageKind::Claims, "plan", "worker"),
+        (StageKind::Review, "verify", "critic"),
+    ] {
+        let request = StageRequest::new(kind, instruction)
+            .field(
+                "numbered_markdown",
+                &[Visibility::Public],
+                "L1 shared document",
+            )
+            .field("stage", &[Visibility::Public], stage);
+        runtime.step::<Claims>(&run, &request).await.unwrap();
+    }
+    let prompts = prompts.lock().unwrap();
+    let prefixes: Vec<_> = prompts
+        .iter()
+        .map(|p| p.split_once("L1 shared document").unwrap().0)
+        .collect();
+    assert_eq!(prefixes[0], prefixes[1]);
+    assert!(
+        prompts
+            .iter()
+            .all(|p| p.matches("L1 shared document").count() == 1)
+    );
+}

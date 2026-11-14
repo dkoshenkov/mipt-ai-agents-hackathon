@@ -74,7 +74,18 @@ impl<'a> StageRequest<'a> {
             let value = (field.serialize)().map_err(|_| StepError::Preparation)?;
             fields.push(json!({"name": field.name, "value": value}));
         }
-        Ok(json!({"instruction": self.instruction, "data": fields}).to_string())
+        // Serialize the ordered data first so a shared first field (the indexed
+        // document) stays a byte-identical cache prefix across different stages.
+        #[derive(Serialize)]
+        struct Prompt<'a> {
+            data: Vec<Value>,
+            instruction: &'a str,
+        }
+        serde_json::to_string(&Prompt {
+            data: fields,
+            instruction: self.instruction,
+        })
+        .map_err(|_| StepError::Preparation)
     }
 }
 

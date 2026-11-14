@@ -42,9 +42,32 @@ pub enum ErrorCategory {
     RestrictedContext,
 }
 
+/// Safe diagnostic metadata; never contains prompts, credentials or response bodies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestError {
+    pub category: ErrorCategory,
+    pub stage: String,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+}
+
+impl RequestError {
+    pub fn new(category: ErrorCategory, stage: &str, reason: impl Into<String>) -> Self {
+        Self {
+            category,
+            stage: stage.into(),
+            reason: reason.into(),
+            http_status: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckOutcome {
     pub check_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<RequestError>,
     pub result: Result<Vec<Finding>, ErrorCategory>,
 }
 
@@ -130,14 +153,17 @@ mod tests {
         };
         let outcomes = vec![
             CheckOutcome {
+                diagnostic: None,
                 check_id: "empty".into(),
                 result: Ok(vec![]),
             },
             CheckOutcome {
+                diagnostic: None,
                 check_id: "failed".into(),
                 result: Err(ErrorCategory::RateLimited),
             },
             CheckOutcome {
+                diagnostic: None,
                 check_id: "found".into(),
                 result: Ok(vec![Finding {
                     description: "Расхождение".into(),

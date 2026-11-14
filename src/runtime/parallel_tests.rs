@@ -111,3 +111,21 @@ async fn validates_and_runs_dynamic_checks_concurrently_with_independent_timeout
     assert!(result[1].result.is_ok());
     assert_eq!(calls.load(Ordering::SeqCst), 4);
 }
+
+#[test]
+fn check_prompts_share_the_document_prefix() {
+    let document = doc(Visibility::Public);
+    let a = CheckInput {
+        document: &document,
+        check: &check("first"),
+    }
+    .prompt();
+    let b = CheckInput {
+        document: &document,
+        check: &check("second"),
+    }
+    .prompt();
+    let prefix = a.strip_suffix(r#""first"}"#).unwrap();
+    assert!(prefix.contains(r#""document":"document""#));
+    assert_eq!(b.strip_suffix(r#""second"}"#), Some(prefix));
+}

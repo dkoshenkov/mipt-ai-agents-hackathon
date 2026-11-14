@@ -54,7 +54,12 @@ pub struct RequestError {
 
 impl RequestError {
     pub fn new(category: ErrorCategory, stage: &str, reason: impl Into<String>) -> Self {
-        Self { category, stage: stage.into(), reason: reason.into(), http_status: None }
+        Self {
+            category,
+            stage: stage.into(),
+            reason: reason.into(),
+            http_status: None,
+        }
     }
 }
 

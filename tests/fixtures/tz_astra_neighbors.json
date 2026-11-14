@@ -1,0 +1,412 @@
+[
+  {
+    "label": "Метод из архивной закупки",
+    "doc": "Документация закупки по 223-ФЗ\n## Текущая закупка\nСпособ закупки: закупка у единственного поставщика\n| Позиция 1 | Производитель: Alpha |\n## Архив. Отменённая закупка прошлого года\nСпособ закупки: открытый конкурс",
+    "assignments": [
+      {
+        "id": "A06",
+        "scope": "позиция 1",
+        "lines": [
+          4
+        ],
+        "context": [],
+        "reason": "Проверить позицию"
+      }
+    ],
+    "candidate": {
+      "scope": "позиция 1",
+      "lines": [
+        4
+      ],
+      "claim": "Предписан Alpha",
+      "basis": "223-ФЗ, ст. 3",
+      "wording": null
+    },
+    "decision": {
+      "index": 0,
+      "verdict": "confirmed",
+      "lines": [
+        4
+      ],
+      "evidence": [
+        {
+          "line": 4,
+          "quote": "Alpha"
+        }
+      ],
+      "context": [],
+      "explanation": "требуется проверка",
+      "basis": "223-ФЗ, ст. 3",
+      "missing": "обоснование",
+      "correction_reason": "уточнение строки позиции",
+      "procedure_source": {
+        "line": 6,
+        "quote": "открытый конкурс"
+      }
+    }
+  },
+  {
+    "label": "Явный ЕП пропущен критиком",
+    "doc": "Документация закупки по 223-ФЗ\nСпособ закупки: закупка у единственного поставщика\n| Позиция 1 | Производитель: Alpha |",
+    "assignments": [
+      {
+        "id": "A06",
+        "scope": "позиция 1",
+        "lines": [
+          3
+        ],
+        "context": [],
+        "reason": "Проверить позицию"
+      }
+    ],
+    "candidate": {
+      "scope": "позиция 1",
+      "lines": [
+        3
+      ],
+      "claim": "Предписан Alpha",
+      "basis": "223-ФЗ, ст. 3",
+      "wording": null
+    },
+    "decision": {
+      "index": 0,
+      "verdict": "confirmed",
+      "lines": [
+        3
+      ],
+      "evidence": [
+        {
+          "line": 3,
+          "quote": "Alpha"
+        }
+      ],
+      "context": [],
+      "explanation": "требуется проверка",
+      "basis": "223-ФЗ, ст. 3",
+      "missing": "обоснование",
+      "correction_reason": "уточнение строки позиции",
+      "procedure_source": null
+    }
+  },
+  {
+    "label": "Адрес соседа по охватывающему назначению",
+    "doc": "Документация закупки по 223-ФЗ\n| Позиция 1 | Насос без указания марки |\n| Позиция 2 | Производитель: Beta |",
+    "assignments": [
+      {
+        "id": "A06",
+        "scope": "позиция 1",
+        "lines": [
+          2,
+          3
+        ],
+        "context": [],
+        "reason": "Проверить позицию"
+      }
+    ],
+    "candidate": {
+      "scope": "позиция 1",
+      "lines": [
+        2
+      ],
+      "claim": "Для позиции 1 навязана марка",
+      "basis": "223-ФЗ, ст. 3",
+      "wording": null
+    },
+    "decision": {
+      "index": 0,
+      "verdict": "needs_review",
+      "lines": [
+        3
+      ],
+      "evidence": [
+        {
+          "line": 3,
+          "quote": "Beta"
+        }
+      ],
+      "context": [],
+      "explanation": "требуется проверка",
+      "basis": "223-ФЗ, ст. 3",
+      "missing": "обоснование",
+      "correction_reason": "уточнение строки позиции",
+      "procedure_source": null
+    }
+  },
+  {
+    "label": "Уточнение scope и строка соседа",
+    "doc": "Документация закупки по 223-ФЗ\n| Позиция 1 | Насос без указания марки |\n| Позиция 2 | Производитель: Beta |",
+    "assignments": [
+      {
+        "id": "A06",
+        "scope": "позиция 1",
+        "lines": [
+          2
+        ],
+        "context": [],
+        "reason": "Проверить позицию"
+      },
+      {
+        "id": "A06",
+        "scope": "позиция 2",
+        "lines": [
+          3
+        ],
+        "context": [],
+        "reason": "Проверить позицию"
+      }
+    ],
+    "candidate": {
+      "scope": "позиция 1 — насос",
+      "lines": [
+        2,
+        3
+      ],
+      "claim": "Для насоса в позиции 1 навязана марка",
+      "basis": "223-ФЗ, ст. 3",
+      "wording": null
+    },
+    "decision": {
+      "index": 0,
+      "verdict": "needs_review",
+      "lines": [
+        3
+      ],
+      "evidence": [
+        {
+          "line": 3,
+          "quote": "Beta"
+        }
+      ],
+      "context": [],
+      "explanation": "требуется проверка",
+      "basis": "223-ФЗ, ст. 3",
+      "missing": "обоснование",
+      "correction_reason": "уточнение строки позиции",
+      "procedure_source": null
+    }
+  },
+  {
+    "label": "Запрет позиции поверх разрешения по умолчанию",
+    "doc": "Документация закупки по 223-ФЗ\nДля всех позиций допускаются эквиваленты, если иное не указано в описании позиции.\n| Позиция 1 | Производитель: Alpha | Эквиваленты не допускаются. |",
+    "assignments": [
+      {
+        "id": "A06",
+        "scope": "позиция 1",
+        "lines": [
+          3
+        ],
+        "context": [
+          2
+        ],
+        "reason": "Проверить позицию"
+      }
+    ],
+    "candidate": {
+      "scope": "позиция 1",
+      "lines": [
+        3
+      ],
+      "claim": "Предписан Alpha",
+      "basis": "223-ФЗ, ст. 3",
+      "wording": null
+    },
+    "decision": {
+      "index": 0,
+      "verdict": "needs_review",
+      "lines": [
+        3
+      ],
+      "evidence": [
+        {
+          "line": 3,
+          "quote": "Alpha"
+        }
+      ],
+      "context": [],
+      "explanation": "требуется проверка",
+      "basis": "223-ФЗ, ст. 3",
+      "missing": "обоснование",
+      "correction_reason": "уточнение строки позиции",
+      "procedure_source": null
+    }
+  },
+  {
+    "label": "Положительный общий текст с оговоренным исключением",
+    "doc": "Документация закупки по 223-ФЗ\nДля всех позиций, кроме позиции 1, допускаются эквиваленты.\n| Позиция 1 | Производитель: Alpha |",
+    "assignments": [
+      {
+        "id": "A06",
+        "scope": "позиция 1",
+        "lines": [
+          3
+        ],
+        "context": [
+          2
+        ],
+        "reason": "Проверить позицию"
+      }
+    ],
+    "candidate": {
+      "scope": "позиция 1",
+      "lines": [
+        3
+      ],
+      "claim": "Предписан Alpha",
+      "basis": "223-ФЗ, ст. 3",
+      "wording": null
+    },
+    "decision": {
+      "index": 0,
+      "verdict": "needs_review",
+      "lines": [
+        3
+      ],
+      "evidence": [
+        {
+          "line": 3,
+          "quote": "Alpha"
+        }
+      ],
+      "context": [],
+      "explanation": "требуется проверка",
+      "basis": "223-ФЗ, ст. 3",
+      "missing": "обоснование",
+      "correction_reason": "уточнение строки позиции",
+      "procedure_source": null
+    }
+  },
+  {
+    "label": "Критик снял A06 по соседней позиции",
+    "doc": "Документация закупки по 223-ФЗ\n| Позиция 1 | Производитель: Alpha |\n| Позиция 2 | Модель | Bravo или эквивалент |",
+    "assignments": [
+      {
+        "id": "A06",
+        "scope": "позиция 1",
+        "lines": [
+          2
+        ],
+        "context": [],
+        "reason": "Проверить позицию"
+      }
+    ],
+    "candidate": {
+      "scope": "позиция 1",
+      "lines": [
+        2
+      ],
+      "claim": "Предписан Alpha",
+      "basis": "223-ФЗ, ст. 3",
+      "wording": null
+    },
+    "decision": {
+      "index": 0,
+      "verdict": "dismissed",
+      "lines": [
+        2
+      ],
+      "evidence": [
+        {
+          "line": 2,
+          "quote": "Alpha"
+        }
+      ],
+      "context": [
+        3
+      ],
+      "explanation": "Позиция 1 разрешает эквивалент, см. строку 3.",
+      "basis": "223-ФЗ, ст. 3",
+      "missing": "обоснование",
+      "correction_reason": "уточнение строки позиции",
+      "procedure_source": null
+    }
+  },
+  {
+    "label": "Разрешение и запрет на повреждённый товар",
+    "doc": "Документация закупки по 223-ФЗ\nСпособ закупки: открытый конкурс\nЭквиваленты допускаются. Поставка повреждённого товара запрещена.",
+    "assignments": [
+      {
+        "id": "A03",
+        "scope": "позиция 1",
+        "lines": [
+          3
+        ],
+        "context": [],
+        "reason": "Проверить позицию"
+      }
+    ],
+    "candidate": {
+      "scope": "позиция 1",
+      "lines": [
+        3
+      ],
+      "claim": "Эквиваленты запрещены",
+      "basis": "223-ФЗ, ст. 3",
+      "wording": null
+    },
+    "decision": {
+      "index": 0,
+      "verdict": "confirmed",
+      "lines": [
+        3
+      ],
+      "evidence": [
+        {
+          "line": 3,
+          "quote": "Эквиваленты допускаются. Поставка повреждённого товара запрещена."
+        }
+      ],
+      "context": [],
+      "explanation": "требуется проверка",
+      "basis": "223-ФЗ, ст. 3",
+      "missing": "обоснование",
+      "correction_reason": "уточнение строки позиции",
+      "procedure_source": {
+        "line": 2,
+        "quote": "открытый конкурс"
+      }
+    }
+  },
+  {
+    "label": "Прямой запрет и необязательное другое условие",
+    "doc": "Документация закупки по 223-ФЗ\nЭквиваленты не допускаются. Нотариальное заверение не требуется.",
+    "assignments": [
+      {
+        "id": "A03",
+        "scope": "позиция 1",
+        "lines": [
+          2
+        ],
+        "context": [],
+        "reason": "Проверить позицию"
+      }
+    ],
+    "candidate": {
+      "scope": "позиция 1",
+      "lines": [
+        2
+      ],
+      "claim": "Эквиваленты запрещены",
+      "basis": "223-ФЗ, ст. 3",
+      "wording": null
+    },
+    "decision": {
+      "index": 0,
+      "verdict": "needs_review",
+      "lines": [
+        2
+      ],
+      "evidence": [
+        {
+          "line": 2,
+          "quote": "Эквиваленты не допускаются"
+        }
+      ],
+      "context": [],
+      "explanation": "требуется проверка",
+      "basis": "223-ФЗ, ст. 3",
+      "missing": "обоснование",
+      "correction_reason": "уточнение строки позиции",
+      "procedure_source": null
+    }
+  }
+]

@@ -27,6 +27,46 @@ struct Claims {
 }
 
 #[tokio::test]
+async fn worker_and_reviewer_share_a_budget_and_receive_their_own_stages() {
+    let worker = Arc::new(Mutex::new(Vec::new()));
+    let reviewer = Arc::new(Mutex::new(Vec::new()));
+    let runtime = Runtime::new(LocalModel(worker.clone()), Duration::from_secs(1))
+        .with_reviewer(LocalModel(reviewer.clone()));
+    let run = ReviewRun::new(4);
+    for (kind, instruction) in [
+        (StageKind::Claims, "extract"),
+        (StageKind::Control, "control"),
+        (StageKind::Comparison, "compare"),
+        (StageKind::Review, "verdict"),
+    ] {
+        runtime
+            .step::<Claims>(&run, &StageRequest::new(kind, instruction))
+            .await
+            .unwrap();
+    }
+    let names = |prompts: &Mutex<Vec<String>>| -> Vec<String> {
+        prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|prompt| {
+                let body: serde_json::Value = serde_json::from_str(prompt).unwrap();
+                body["instruction"].as_str().unwrap().to_owned()
+            })
+            .collect()
+    };
+    assert_eq!(names(&worker), ["extract"]);
+    assert_eq!(names(&reviewer), ["control", "compare", "verdict"]);
+    assert_eq!(run.attempts(), 4);
+    assert_eq!(
+        runtime
+            .step::<Claims>(&run, &StageRequest::new(StageKind::Review, "retry"))
+            .await,
+        Err(StepError::BudgetExhausted)
+    );
+}
+
+#[tokio::test]
 async fn serialization_failure_preserves_the_attempt_budget() {
     let prompts = Arc::new(Mutex::new(Vec::new()));
     let runtime = Runtime::new(LocalModel(prompts.clone()), Duration::from_secs(1));
@@ -158,4 +198,35 @@ async fn rejects_all_restricted_sources_before_serializing_any_field() {
             .is_ok()
     );
     assert_eq!(prompts.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn indexed_document_is_the_same_prefix_for_worker_and_critic() {
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let runtime = Runtime::new(LocalModel(prompts.clone()), Duration::from_secs(1));
+    let run = ReviewRun::new(2);
+    for (kind, instruction, stage) in [
+        (StageKind::Claims, "plan", "worker"),
+        (StageKind::Review, "verify", "critic"),
+    ] {
+        let request = StageRequest::new(kind, instruction)
+            .field(
+                "numbered_markdown",
+                &[Visibility::Public],
+                "L1 shared document",
+            )
+            .field("stage", &[Visibility::Public], stage);
+        runtime.step::<Claims>(&run, &request).await.unwrap();
+    }
+    let prompts = prompts.lock().unwrap();
+    let prefixes: Vec<_> = prompts
+        .iter()
+        .map(|p| p.split_once("L1 shared document").unwrap().0)
+        .collect();
+    assert_eq!(prefixes[0], prefixes[1]);
+    assert!(
+        prompts
+            .iter()
+            .all(|p| p.matches("L1 shared document").count() == 1)
+    );
 }

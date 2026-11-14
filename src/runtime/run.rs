@@ -10,6 +10,10 @@ pub struct ReviewRun {
 }
 
 impl ReviewRun {
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
     pub fn new(limit: usize) -> Self {
         Self {
             id: format!(

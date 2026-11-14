@@ -1,0 +1,17 @@
+{
+  "retrieved_at": "2026-11-13",
+  "cards": [{
+    "kind": "standard",
+    "designation": "ГОСТ 9013-59",
+    "full_designation": "ГОСТ 9013-59 (ИСО 6508-86)",
+    "title": "Металлы. Метод измерения твердости по Роквеллу",
+    "url": "https://protect.gost.ru/gost/details/65c2a51a-9443-4301-9100-ed5f50fc5a96",
+    "scope": "Настоящий стандарт устанавливает метод измерения твердости по Роквеллу (шкалы А, В, С, D, E, F, G, H, K) при температуре 20 (плюс 15 минус 10) град. С.",
+    "temperature_scope": {"method": "Роквелла", "min_c": 10, "max_c": 35},
+    "effective_from": "1960-01-01",
+    "replaces": "ОСТ 10242-40",
+    "replacement": null,
+    "status_at_retrieval": "Действует",
+    "rf_note": null
+  }]
+}

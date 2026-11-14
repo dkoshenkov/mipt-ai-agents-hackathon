@@ -75,7 +75,17 @@ impl<'a> StageRequest<'a> {
             let value = (field.serialize)().map_err(|_| StepError::Preparation)?;
             fields.push(json!({"name": field.name, "value": value}));
         }
-        Ok(json!({"instruction": self.instruction, "data": fields}).to_string())
+        // Struct field order puts the shared instruction before changing packet data.
+        #[derive(Serialize)]
+        struct Prompt<'a> {
+            instruction: &'a str,
+            data: Vec<Value>,
+        }
+        serde_json::to_string(&Prompt {
+            instruction: self.instruction,
+            data: fields,
+        })
+        .map_err(|_| StepError::Preparation)
     }
 }
 

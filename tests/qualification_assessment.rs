@@ -244,3 +244,207 @@ async fn extraction_retains_a_range_and_an_alternative_as_two_conditions() {
         matches!(&record(&report,"interface").requirement.constraint,Constraint::Alternatives {values} if values.len()==2)
     );
 }
+
+#[tokio::test]
+async fn mixed_decode_and_evidence_failures_share_retries_and_preserve_final_review() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for (budget, expected_calls, recovered) in [(6, 4, true), (5, 3, false)] {
+        let n = AtomicUsize::new(0);
+        let worker = Script::new(move |stage, data| {
+            if stage.starts_with("Extract") {
+                return Ok(extracted(vec![qualitative(
+                    &blocks(data, "packet"),
+                    "Required camera",
+                    "camera",
+                    "present",
+                )]));
+            }
+            Ok(match n.fetch_add(1, Ordering::SeqCst) {
+                0 => json!({"unexpected":true}),
+                1 => assessed(data, Assessment::Justified, "Required camera"),
+                2 => {
+                    let mut reply = ask(data, "task");
+                    reply["requirement_id"] = json!("unknown");
+                    reply
+                }
+                _ => ask(data, "task"),
+            })
+        });
+        let report = review_equipment_adequacy(
+            &input("Required camera"),
+            &QualificationOptions {
+                model_attempts: budget,
+                ..Default::default()
+            },
+            &runtime(worker.clone()),
+            &reviewer(),
+            &SnapshotHttp::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(worker.count(), 1 + expected_calls);
+        assert_eq!(report.coverage.review, ReviewStatus::Completed);
+        assert_eq!(report.model_attempts, budget);
+        assert_eq!(report.questions().count(), usize::from(recovered));
+        assert_eq!(
+            report
+                .coverage
+                .gaps
+                .iter()
+                .filter(|g| g.failure.stage == "assessment")
+                .count(),
+            usize::from(!recovered)
+        );
+        let calls = worker.calls.lock().unwrap();
+        assert!(
+            calls[3]
+                .to_string()
+                .contains("independent operational basis")
+        );
+    }
+}
+
+#[tokio::test]
+async fn partial_extraction_retries_without_losing_or_duplicating_valid_requirements() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = AtomicUsize::new(0);
+    let worker = Script::new(move |stage, data| {
+        if stage.starts_with("Extract") {
+            let packet = blocks(data, "packet");
+            let valid = qualitative(&packet, "Required camera", "camera", "present");
+            let mut other = qualitative(&packet, "Required lens", "lens", "present");
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                other.evidence[0].quote = "Wrong citation".into();
+                return Ok(extracted(vec![valid, other]));
+            }
+            return Ok(extracted(vec![other]));
+        }
+        Ok(ask(data, "operating mode"))
+    });
+    let report = review_equipment_adequacy(
+        &input("Required camera\nRequired lens"),
+        &QualificationOptions::default(),
+        &runtime(worker.clone()),
+        &reviewer(),
+        &SnapshotHttp::default(),
+    )
+    .await
+    .unwrap();
+    assert!(report.coverage.complete());
+    assert_eq!(
+        report
+            .requirements
+            .iter()
+            .map(|r| r.requirement.property.as_str())
+            .collect::<Vec<_>>(),
+        ["camera", "lens"]
+    );
+    assert_eq!(worker.count(), 4);
+}
+
+#[tokio::test]
+async fn retries_and_reads_leave_first_attempts_for_later_requirements() {
+    let worker = Script::new(|instruction, data| {
+        if instruction.starts_with("Extract") {
+            let b = blocks(data, "packet");
+            return Ok(extracted(vec![
+                numeric(
+                    &b,
+                    "Capacity >= 2 kg",
+                    "capacity",
+                    "2",
+                    "kg",
+                    Operator::AtLeast,
+                ),
+                numeric(
+                    &b,
+                    "Memory >= 1000 records",
+                    "memory",
+                    "1000",
+                    "records",
+                    Operator::AtLeast,
+                ),
+            ]));
+        }
+        if data["current_requirement"]["property"] == "capacity" {
+            return Ok(json!(Decision::Read {
+                requirement_id: data["current_requirement"]["id"].as_str().unwrap().into(),
+                block_ids: vec![blocks(data, "blocks")[0].id.clone()],
+            }));
+        }
+        Ok(ask(data, "maximum records before export"))
+    });
+    let report = review_equipment_adequacy(
+        &input("Capacity >= 2 kg\nMemory >= 1000 records"),
+        &QualificationOptions {
+            model_attempts: 4,
+            ..Default::default()
+        },
+        &runtime(worker),
+        &reviewer(),
+        &SnapshotHttp::default(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        record(&report, "memory").outcome,
+        RequirementOutcome::Pending {
+            question: Some(_),
+            ..
+        }
+    ));
+    assert!(matches!(report.coverage.review, ReviewStatus::Completed));
+    assert_eq!(report.model_attempts, 4);
+}
+
+#[tokio::test]
+async fn invalid_response_retries_do_not_take_later_requirements_first_attempt() {
+    let worker = Script::new(|instruction, data| {
+        if instruction.starts_with("Extract") {
+            let b = blocks(data, "packet");
+            return Ok(extracted(vec![
+                numeric(
+                    &b,
+                    "Capacity >= 2 kg",
+                    "capacity",
+                    "2",
+                    "kg",
+                    Operator::AtLeast,
+                ),
+                numeric(
+                    &b,
+                    "Memory >= 1000 records",
+                    "memory",
+                    "1000",
+                    "records",
+                    Operator::AtLeast,
+                ),
+            ]));
+        }
+        if data["current_requirement"]["property"] == "capacity" {
+            return Ok(ask(data, ""));
+        }
+        Ok(ask(data, "maximum records before export"))
+    });
+    let report = review_equipment_adequacy(
+        &input("Capacity >= 2 kg\nMemory >= 1000 records"),
+        &QualificationOptions {
+            model_attempts: 4,
+            ..Default::default()
+        },
+        &runtime(worker),
+        &reviewer(),
+        &SnapshotHttp::default(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        record(&report, "memory").outcome,
+        RequirementOutcome::Pending {
+            question: Some(_),
+            ..
+        }
+    ));
+    assert!(matches!(report.coverage.review, ReviewStatus::Completed));
+    assert_eq!(report.model_attempts, 4);
+}

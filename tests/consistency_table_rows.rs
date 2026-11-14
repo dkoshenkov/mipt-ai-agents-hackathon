@@ -304,6 +304,77 @@ async fn carrying_capacity_belongs_to_equipment_and_its_work_section() {
 }
 
 #[tokio::test]
+async fn converter_format_keeps_both_sides_of_the_new_equipment_questions() {
+    // Same mixed representation emitted by /api/convert: inline HTML for merged cells,
+    // Markdown pipes for the work list, emphasis and a plain-text register title.
+    let converted = r#"\- поставку нового лифта и лифтового оборудования;
+
+\- монтаж нового лифта и лифтового оборудования;
+
+Новый грузовой лифт устанавливается взамен отработавшего лифта, грузоподъемность 500 кг.
+
+**Технические характеристики поставляемого для монтажа лифта:**
+
+<table><thead><tr><th><p><strong>№ п/п</strong></p></th><th><p>Наименование оборудования</p></th><th><p>Технические характеристики</p></th></tr></thead><tbody><tr><td>1</td><td>Тип лифта</td><td><p>пассажирский</p></td></tr><tr><td>3</td><td>Грузоподъемность, кг</td><td><p>300</p></td></tr><tr><td colspan="3">Кабина</td></tr></tbody></table>
+
+ДЕФЕКТНАЯ ВЕДОМОСТЬ
+
+на выполнение работ по замене грузового лифта
+
+| **№ п/п** | **Наименование работ** | **Единица измерения** | **Объем** |
+| --- | --- | --- | --- |
+|  | **Раздел 2. Монтажные работы.** |  |  |
+| 2 | Лифт грузовой со скоростью движения кабины до 0,5 м/с: грузоподъемностью 500 кг на 4 остановки | шт. | 1 |
+"#;
+    let runtime = Runtime::new(Replay, Duration::from_secs(1));
+    let catalog = serde_json::from_str(include_str!("fixtures/consistency/catalog.json")).unwrap();
+    for (markdown, expected) in [
+        (converted.to_owned(), 2),
+        (
+            converted
+                .replace("пассажирский", "грузовой")
+                .replace(">300<", ">500<"),
+            0,
+        ),
+    ] {
+        let document = Document {
+            markdown,
+            visibility: Visibility::Public,
+        };
+        let report = review_markdown(
+            &document,
+            ReviewOptions {
+                model_attempts: 0,
+                ..Default::default()
+            },
+            &runtime,
+            &catalog,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.model_attempts, 0);
+        assert_eq!(report.investigations.len(), expected);
+        for result in &report.investigations {
+            assert!(result.outcome.is_err());
+            let comparison = result.source_comparison.as_ref().unwrap();
+            let sides = &comparison.sides;
+            assert!(sides.iter().all(|e| e.version == report.version));
+            let excerpts = sides
+                .each_ref()
+                .map(|e| &document.markdown[e.range.clone()]);
+            if result.candidate.category == "numeric" {
+                assert!(excerpts.contains(&"300") && excerpts.iter().any(|s| s.contains("500 кг")));
+            } else {
+                assert!(
+                    excerpts.contains(&"пассажирский")
+                        && excerpts.iter().any(|s| s.contains("Новый грузовой лифт"))
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 #[ignore = "requires the original experiment document"]
 async fn actual_lift_document_when_available() {
     let path = concat!(

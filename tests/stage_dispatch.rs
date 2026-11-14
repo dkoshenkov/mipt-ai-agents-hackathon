@@ -91,7 +91,7 @@ async fn concurrent_steps_share_budget_but_runs_are_independent() {
 }
 
 #[tokio::test]
-async fn failures_consume_one_attempt_without_retry() {
+async fn a_single_attempt_budget_preserves_the_original_failure() {
     let cases = [
         (
             Err(ErrorCategory::RateLimited),
@@ -139,5 +139,33 @@ async fn failures_consume_one_attempt_without_retry() {
             Err(StepError::BudgetExhausted)
         );
         assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn retries_only_invalid_responses_up_to_three_times() {
+    for (response, expected, calls_expected) in [
+        (Ok("not json"), ErrorCategory::InvalidResponse, 4),
+        (
+            Err(ErrorCategory::RateLimited),
+            ErrorCategory::RateLimited,
+            1,
+        ),
+        (Err(ErrorCategory::Provider), ErrorCategory::Provider, 1),
+        (Err(ErrorCategory::TimedOut), ErrorCategory::TimedOut, 1),
+    ] {
+        let (runtime, calls) = runtime(response, Duration::ZERO, Duration::from_secs(1));
+        let run = ReviewRun::new(10);
+        assert_eq!(
+            runtime
+                .step::<Output>(&run, &StageRequest::new(StageKind::Review, "Review"))
+                .await,
+            Err(StepError::Model(expected))
+        );
+        assert_eq!(run.attempts(), calls_expected);
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), calls_expected);
+        assert!(!calls[0].contains("retry_feedback"));
+        assert!(calls[1..].iter().all(|p| p.contains("retry_feedback")));
     }
 }

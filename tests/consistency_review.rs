@@ -239,6 +239,17 @@ async fn control_pass_restores_a_conflict_with_versioned_sources() {
     assert_eq!(report.investigations.len(), 1);
     let result = &report.investigations[0];
     assert!(matches!(result.outcome, Ok(Verdict::Confirmed { .. })));
+    let comparison = result.source_comparison.as_ref().unwrap();
+    assert_eq!(
+        comparison
+            .sides
+            .each_ref()
+            .map(|s| &document.markdown[s.range.clone()]),
+        [
+            "Лифт А должен иметь массу ровно 300 кг.",
+            "Лифт А должен иметь массу ровно 500 кг."
+        ]
+    );
     for value in ["300", "500"] {
         assert!(
             result.candidate.evidence.iter().any(
@@ -324,4 +335,74 @@ async fn control_pass_restores_a_conflict_with_versioned_sources() {
             .iter()
             .all(|p| p.stop.as_deref() == Some("RestrictedContext"))
     );
+}
+
+#[tokio::test]
+async fn bounds_both_read_passes_to_three_and_preserves_subject_order() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    struct ConcurrentReads {
+        active: [AtomicUsize; 2],
+        peak: Arc<[AtomicUsize; 2]>,
+        completed: [AtomicUsize; 2],
+        first_packets: usize,
+    }
+
+    impl Model for ConcurrentReads {
+        async fn complete(&self, prompt: &str) -> Result<String, ErrorCategory> {
+            let request: Value = serde_json::from_str(prompt).unwrap();
+            let fields = request["data"].as_array().unwrap();
+            let pass = usize::from(fields.iter().any(|f| f["name"] == "existing_claims"));
+            if pass == 1 {
+                assert_eq!(self.completed[0].load(SeqCst), self.first_packets);
+            }
+            let n = self.active[pass].fetch_add(1, SeqCst) + 1;
+            self.peak[pass].fetch_max(n, SeqCst);
+            let packet = &fields.iter().find(|f| f["name"] == "packet").unwrap()["value"];
+            let first_id = packet["subjects"][0].as_u64().unwrap();
+            tokio::time::sleep(Duration::from_millis(if first_id == 0 { 12 } else { 1 })).await;
+            self.active[pass].fetch_sub(1, SeqCst);
+            self.completed[pass].fetch_add(1, SeqCst);
+            Ok(
+                json!({"claims":[], "priority_rules":[], "standard_mentions":[], "refinements":[]})
+                    .to_string(),
+            )
+        }
+    }
+
+    let doc = Document {
+        markdown: (0..21)
+            .map(|i| format!("Paragraph {i} {}\n\n", "x".repeat(180)))
+            .collect(),
+        visibility: Visibility::Public,
+    };
+    let index =
+        procurement_review::consistency::markdown::MarkdownIndex::new(&doc.markdown).unwrap();
+    let options = ReviewOptions {
+        packet_bytes: 820,
+        ..Default::default()
+    };
+    let packets = index.packets(options.packet_bytes);
+    let model = ConcurrentReads {
+        active: Default::default(),
+        peak: Default::default(),
+        completed: Default::default(),
+        first_packets: packets.packets.len(),
+    };
+    let peak = Arc::clone(&model.peak);
+    let runtime = Runtime::new(model, Duration::from_secs(2));
+    let catalog = serde_json::from_str(include_str!("fixtures/consistency/catalog.json")).unwrap();
+    let report = review_markdown(&doc, options, &runtime, &catalog)
+        .await
+        .unwrap();
+    for pass in [false, true] {
+        let ids: Vec<_> = report
+            .packets
+            .iter()
+            .filter(|p| p.control_pass == pass)
+            .flat_map(|p| p.subjects.iter().copied())
+            .collect();
+        assert_eq!(ids, (0..index.blocks.len()).collect::<Vec<_>>());
+    }
+    assert!(report.packets.iter().all(|p| p.stop.is_none()));
+    assert_eq!(peak.each_ref().map(|p| p.load(SeqCst)), [3, 3]);
 }

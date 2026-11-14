@@ -221,17 +221,20 @@ async fn extraction_packets_stay_bounded_when_the_document_exceeds_context() {
         extraction_batch_bytes: 1_000,
         ..Default::default()
     };
+    let review = Script::new(|_, data| Ok(json!(no_change_review(data))));
     let report = review_equipment_adequacy(
         &input(&text),
         &options,
         &runtime(worker.clone()),
-        &reviewer(),
+        &runtime(review.clone()),
         &SnapshotHttp::default(),
     )
     .await
     .unwrap();
     assert!(serde_json::to_vec(&report.blocks).unwrap().len() > options.max_context_bytes);
     assert!(worker.count() > 1);
+    assert!(review.count() > 1);
+    assert!(report.coverage.complete());
     assert!(report.coverage.blocks.iter().all(|b| b.extracted));
     assert!(
         !report
@@ -536,4 +539,132 @@ async fn ambiguous_attachment_scope_and_reference_only_passports_do_not_create_o
         assert_eq!(report.coverage.complete(), !ambiguous);
         assert!(report.blocks.iter().any(|b| b.text.contains("100 MHz")));
     }
+}
+
+#[tokio::test]
+async fn failed_final_packet_preserves_records_and_identifies_its_blocks() {
+    let text = format!(
+        "Capacity >= 2 kg\nTask: weigh samples up to 1,5 kg, including the fixture.\n{}",
+        (0..95)
+            .map(|i| format!("Delivery item {i}: supplementary information.\n"))
+            .collect::<String>()
+    );
+    let options = QualificationOptions {
+        max_context_bytes: 20_000,
+        model_attempts: 100,
+        ..Default::default()
+    };
+    let review = Script::new(|_, data| {
+        assert_eq!(data["packet"], true);
+        let ids = data["original_blocks"].as_array().unwrap();
+        if ids.contains(&json!("tz:96")) {
+            return Err(ErrorCategory::TimedOut);
+        }
+        let mut response = no_change_review(data);
+        if ids.contains(&json!("tz:0")) {
+            let r = &data["records"][0]["requirement"];
+            response.notes.push(ReviewNote {
+                id: "remove".into(),
+                reason: "Reference only".into(),
+                evidence: vec![quote(&blocks(data, "blocks"), "Capacity >= 2 kg")],
+                change: ReviewChange::Remove {
+                    requirement_id: r["id"].as_str().unwrap().into(),
+                },
+            });
+        }
+        Ok(json!(response))
+    });
+    let report = review_equipment_adequacy(
+        &input(&text),
+        &options,
+        &runtime(balance_worker(false)),
+        &runtime(review.clone()),
+        &SnapshotHttp::default(),
+    )
+    .await
+    .unwrap();
+    assert!(review.count() > 1);
+    assert_eq!(report.requirements.len(), 1);
+    assert!(report.notes.is_empty());
+    let gaps: Vec<_> = report
+        .coverage
+        .gaps
+        .iter()
+        .filter(|g| g.failure.stage == "final_review")
+        .collect();
+    assert_eq!(gaps.len(), 1);
+    assert!(gaps[0].block_ids.contains(&"tz:96".into()));
+    assert!(!gaps[0].block_ids.contains(&"tz:0".into()));
+    assert_eq!(
+        gaps[0].failure.reason,
+        FailureReason::Model(ErrorCategory::TimedOut)
+    );
+}
+
+#[tokio::test]
+async fn shared_budget_reaches_all_final_packets_after_assessment_retry() {
+    let text = format!(
+        "Capacity >= 2 kg\nMemory >= 1000 records\n{}",
+        (0..45)
+            .map(|i| format!("Delivery item {i}: supplementary information.\n"))
+            .collect::<String>()
+    );
+    let worker = Script::new(|instruction, data| {
+        if instruction.starts_with("Extract") {
+            let b = blocks(data, "packet");
+            let mut requirements = Vec::new();
+            if b.iter().any(|b| b.text.contains("Capacity >= 2 kg")) {
+                requirements.push(numeric(
+                    &b,
+                    "Capacity >= 2 kg",
+                    "capacity",
+                    "2",
+                    "kg",
+                    Operator::AtLeast,
+                ));
+            }
+            if b.iter().any(|b| b.text.contains("Memory >= 1000 records")) {
+                requirements.push(numeric(
+                    &b,
+                    "Memory >= 1000 records",
+                    "memory",
+                    "1000",
+                    "records",
+                    Operator::AtLeast,
+                ));
+            }
+            return Ok(extracted(requirements));
+        }
+        if data["current_requirement"]["property"] == "capacity" {
+            return Ok(ask(data, ""));
+        }
+        Ok(ask(data, "maximum records before export"))
+    });
+    let review = Script::new(|_, data| Ok(json!(no_change_review(data))));
+    let options = QualificationOptions {
+        max_context_bytes: 20_000,
+        model_attempts: 8,
+        ..Default::default()
+    };
+    let report = review_equipment_adequacy(
+        &input(&text),
+        &options,
+        &runtime(worker.clone()),
+        &runtime(review.clone()),
+        &SnapshotHttp::default(),
+    )
+    .await
+    .unwrap();
+    assert!(review.count() > 1);
+    assert!(matches!(report.coverage.review, ReviewStatus::Completed));
+    assert!(report.coverage.blocks.iter().all(|b| b.reviewed));
+    assert!(matches!(
+        record(&report, "memory").outcome,
+        RequirementOutcome::Pending {
+            question: Some(_),
+            ..
+        }
+    ));
+    assert_eq!(report.model_attempts, worker.count() + review.count());
+    assert!(report.model_attempts <= options.model_attempts);
 }

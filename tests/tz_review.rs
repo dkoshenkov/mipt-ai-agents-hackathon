@@ -342,16 +342,38 @@ async fn legacy_verdict_is_not_a_publishable_observation() {
     let mut d = decision(0, "confirmed", false);
     d.as_object_mut().unwrap().remove("observation");
     d["verdict"] = json!("confirmed");
-    let model = runtime(vec![
+    let mut replies = vec![
         plan("uncertain", &["A04"]),
         json!({"reviewed":[0],"candidates":[candidate("условие")]}),
-        json!({"decisions":[d]}),
-    ]);
+    ];
+    replies.extend(vec![json!({"decisions":[d]}); 4]);
+    let model = runtime(replies);
     let r = review(&model, &document(), &[], 7).await.unwrap();
+    assert_eq!(r.attempts, 6);
     assert!(r.findings.is_empty());
     assert!(
         r.coverage
             .iter()
             .any(|o| o.stage == "critic" && o.state == "error")
+    );
+}
+
+#[tokio::test]
+async fn empty_toc_anchor_is_not_applicability_evidence() {
+    let mut doc = document();
+    doc.markdown = format!("<a id=\"_Toc123\"></a>\n{}", doc.markdown);
+    let mut p = plan("applicable", &[]);
+    p["line"] = json!(1);
+    let model = runtime(vec![p]);
+    let r = review(&model, &doc, &[], 7).await.unwrap();
+    assert_eq!(
+        r.regime,
+        Some(procurement_review::runtime::tz_review::Regime::Uncertain)
+    );
+    assert!(r.applicability_source.is_none());
+    assert!(
+        r.coverage
+            .iter()
+            .any(|o| o.check == "A01" && o.state == "rejected")
     );
 }

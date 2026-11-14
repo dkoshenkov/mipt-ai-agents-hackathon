@@ -12,6 +12,7 @@ pub enum StageKind {
     Review,
     Control,
     Comparison,
+    Search,
 }
 
 /// An application-defined instruction for a typed model stage.
@@ -58,7 +59,7 @@ impl<'a> StageRequest<'a> {
         self
     }
 
-    fn prepare(&self) -> Result<String, StepError> {
+    pub(super) fn prepare(&self) -> Result<String, StepError> {
         if self.fields.iter().any(|field| {
             field.sources.is_empty()
                 || field
@@ -74,18 +75,37 @@ impl<'a> StageRequest<'a> {
             let value = (field.serialize)().map_err(|_| StepError::Preparation)?;
             fields.push(json!({"name": field.name, "value": value}));
         }
-        // Serialize the ordered data first so a shared first field (the indexed
-        // document) stays a byte-identical cache prefix across different stages.
+        // Document-wide checks share the numbered source across different instructions.
+        // Packet-based checks share the instruction across different source fragments.
         #[derive(Serialize)]
-        struct Prompt<'a> {
-            data: Vec<Value>,
-            instruction: &'a str,
+        #[serde(untagged)]
+        enum Prompt<'a> {
+            DocumentFirst {
+                data: Vec<Value>,
+                instruction: &'a str,
+            },
+            InstructionFirst {
+                instruction: &'a str,
+                data: Vec<Value>,
+            },
         }
-        serde_json::to_string(&Prompt {
-            data: fields,
-            instruction: self.instruction,
-        })
-        .map_err(|_| StepError::Preparation)
+        let instruction = self.instruction;
+        let prompt = if self
+            .fields
+            .first()
+            .is_some_and(|field| field.name == "numbered_markdown")
+        {
+            Prompt::DocumentFirst {
+                data: fields,
+                instruction,
+            }
+        } else {
+            Prompt::InstructionFirst {
+                instruction,
+                data: fields,
+            }
+        };
+        serde_json::to_string(&prompt).map_err(|_| StepError::Preparation)
     }
 }
 
@@ -106,7 +126,7 @@ impl<M: Model> Runtime<M> {
         request: &StageRequest<'_>,
     ) -> Result<T, StepError> {
         let model = match request.kind {
-            StageKind::Claims => &self.model,
+            StageKind::Claims | StageKind::Search => &self.model,
             StageKind::Review | StageKind::Control | StageKind::Comparison => self.reviewer(),
         };
         let stage = super::logging::TypedStage::start(&run.id, request.kind);

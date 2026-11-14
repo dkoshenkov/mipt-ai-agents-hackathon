@@ -1,0 +1,44 @@
+{
+  "version": "1f1fc504364da73d09bda8aa9f5bc5655ba362bcf6b3d7ddf0eca8ce4db83444",
+  "conflicts": [
+    {
+      "key": "L1",
+      "object": "новый лифт № 1",
+      "property": "грузоподъёмность",
+      "sides": [
+        [
+          37,
+          154
+        ],
+        [
+          379,
+          496
+        ]
+      ],
+      "qualifiers": [],
+      "choice_basis": [
+        [
+          155,
+          344
+        ]
+      ],
+      "action": "selected",
+      "selected_side": 0
+    }
+  ],
+  "controls": [
+    {
+      "key": "L2",
+      "sides": [
+        [
+          497,
+          610
+        ],
+        [
+          632,
+          767
+        ]
+      ]
+    }
+  ]
+}

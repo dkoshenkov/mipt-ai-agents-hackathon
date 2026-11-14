@@ -1,0 +1,55 @@
+---
+config:
+  theme: base
+  htmlLabels: false
+  fontFamily: "Arial, sans-serif"
+  themeVariables:
+    fontFamily: "Arial, sans-serif"
+    fontSize: "16px"
+    primaryColor: "#f7f9fb"
+    primaryTextColor: "#173247"
+    primaryBorderColor: "#69808c"
+    lineColor: "#506676"
+    edgeLabelBackground: "#ffffff"
+  flowchart:
+    htmlLabels: false
+    curve: linear
+    nodeSpacing: 26
+    rankSpacing: 34
+    padding: 12
+    wrappingWidth: 255
+    subGraphTitleMargin:
+      top: 8
+      bottom: 20
+---
+flowchart TD
+    accTitle: Проверка одного требования и возврат по ответу заказчика
+    accDescr: При первом обходе и при замечании ревьюера проверяется одно требование. Для позднего ответа приложение передаёт сохранённый отчёт и исходные материалы. Несовпадение возвращает прежний отчёт. При совпадении агент использует в том числе ранее не цитированные страницы паспорта. Числовое или качественное значение возвращается в оценку после чтения применимого первоисточника.
+    Start([Обход или замечание<br/>Проверить требование i]) --> Enough{"Достаточно оснований<br/>для оценки требования i?"}
+    Late[/"Поздний ответ, отчёт,<br/>исходное ТЗ и вложения"/] --> Valid{"Совпали версии, видимость<br/>и адрес открытого вопроса?"}
+    Valid -->|Нет| Reject[/"Вернуть прежний отчёт<br/>и причину"/]
+    Valid -->|Да| Resume["Применить ответ к требованию i<br/>Использовать весь исходный комплект"]
+    Resume --> Enough
+    Enough -->|Да| Verdict[/"Вернуть обоснованную оценку"/]
+    Enough -->|Нет| Gap{"Какого факта<br/>не хватает?"}
+    Gap -->|Задача заказчика| Answer{"Есть новый ответ в ТЗ,<br/>приложении или уточнении?"}
+    Answer -->|Ответ уже учтён| Pending[/"Указать недостающий факт<br/>или техническую причину"/]
+    Answer -->|Да| Add["Добавить ответ заказчика<br/>или проверенный фрагмент"]
+    Answer -->|Нет| Ask[/"Вернуть адресный вопрос<br/>о задаче заказчика"/]
+
+    Gap -->|Свойства прибора| Attached{"Подходящий паспорт<br/>или методика приложены?"}
+    Attached -->|Да| Read["Прочитать оригинал напрямую<br/>Вложение, HTML или PDF"]
+    Attached -->|Нет| Search[["Grok Web Search<br/>Найти адрес первоисточника"]]
+    Search -->|Адрес найден| Read
+    Search -->|Нет адреса или сбой| Pending
+    Read --> Match{"Фрагмент устанавливает значение<br/>для нужной модели и условий?"}
+    Match -->|Да| Proof["Сохранить цитату и место<br/>Для величины — применимую единицу<br/>Для свойства — точное значение"]
+    Proof -->|Новый факт| Add
+    Match -->|Нет или документ не прочитан| Pending
+    Add ==>|Повторить оценку требования i| Enough
+    Proof -->|Факт уже учтён| Pending
+    classDef inner fill:#dff1fc,stroke:#116b9b,color:#12384e,stroke-width:2px
+    classDef source fill:#fff1d5,stroke:#a46a15,color:#59390b,stroke-width:2px
+    class Enough,Add,Valid,Resume inner
+    class Read,Match,Proof source
+    linkStyle 20 stroke:#1376a9,stroke-width:4px

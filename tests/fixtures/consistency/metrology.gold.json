@@ -1,0 +1,71 @@
+{
+  "version": "6ecf0a4aa25dcd783abf0a27c8f675853a74134bcb7726a8ba76331f48e3041c",
+  "conflicts": [
+    {
+      "key": "M1",
+      "object": "комплект № 1",
+      "property": "количество входящих твердомеров",
+      "sides": [
+        [
+          45,
+          123
+        ],
+        [
+          124,
+          202
+        ]
+      ],
+      "qualifiers": [],
+      "choice_basis": [],
+      "action": "ask"
+    }
+  ],
+  "standards": [
+    {
+      "key": "M5",
+      "range": [
+        888,
+        1062
+      ],
+      "edition": "ГОСТ 9013-59",
+      "applicability": "SupportedWithinComparedConditions"
+    },
+    {
+      "key": "M6",
+      "range": [
+        1063,
+        1237
+      ],
+      "edition": "ГОСТ 9013-59",
+      "applicability": "OutsideTemperatureRange"
+    }
+  ],
+  "controls": [
+    {
+      "key": "M2",
+      "sides": [
+        [
+          45,
+          123
+        ],
+        [
+          288,
+          354
+        ]
+      ]
+    },
+    {
+      "key": "M3",
+      "sides": [
+        [
+          399,
+          548
+        ],
+        [
+          549,
+          646
+        ]
+      ]
+    }
+  ]
+}

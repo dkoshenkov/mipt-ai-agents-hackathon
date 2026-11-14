@@ -27,6 +27,10 @@ impl ReviewRun {
         self.attempts.load(Ordering::Relaxed)
     }
 
+    pub fn remaining(&self) -> usize {
+        self.limit.saturating_sub(self.attempts())
+    }
+
     pub(super) fn reserve(&self) -> Option<usize> {
         let mut used = self.attempts();
         while used < self.limit {

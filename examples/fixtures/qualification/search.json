@@ -1,0 +1,12 @@
+[
+  {
+    "text": "A primary-source candidate; must be read directly.",
+    "citations": [],
+    "sources": [
+      "https://manufacturer.example/hardness.html"
+    ],
+    "tool_usage": {
+      "SERVER_SIDE_TOOL_WEB_SEARCH": 1
+    }
+  }
+]

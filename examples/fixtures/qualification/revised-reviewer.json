@@ -1,0 +1,72 @@
+[
+  {
+    "operation": "review",
+    "response": {
+      "notes": [],
+      "blocks": [
+        {
+          "block_id": "tz:0",
+          "conditions": [],
+          "no_requirements_reason": "Context or non-technical block"
+        },
+        {
+          "block_id": "tz:1",
+          "conditions": [],
+          "no_requirements_reason": "Context or non-technical block"
+        },
+        {
+          "block_id": "tz:2",
+          "conditions": [
+            {
+              "condition": {
+                "block_id": "tz:2",
+                "quote": "Capacity >= 2 kg"
+              },
+              "requirement_id": "requirement-1",
+              "note_id": null
+            }
+          ],
+          "no_requirements_reason": null
+        },
+        {
+          "block_id": "tz:3",
+          "conditions": [
+            {
+              "condition": {
+                "block_id": "tz:3",
+                "quote": "Division <= 0,01 g"
+              },
+              "requirement_id": "requirement-2",
+              "note_id": null
+            }
+          ],
+          "no_requirements_reason": null
+        },
+        {
+          "block_id": "tz:4",
+          "conditions": [],
+          "no_requirements_reason": "Context or non-technical block"
+        },
+        {
+          "block_id": "tz:5",
+          "conditions": [],
+          "no_requirements_reason": "Context or non-technical block"
+        },
+        {
+          "block_id": "tz:6",
+          "conditions": [
+            {
+              "condition": {
+                "block_id": "tz:6",
+                "quote": "Memory >= 1000 records"
+              },
+              "requirement_id": "requirement-3",
+              "note_id": null
+            }
+          ],
+          "no_requirements_reason": null
+        }
+      ]
+    }
+  }
+]

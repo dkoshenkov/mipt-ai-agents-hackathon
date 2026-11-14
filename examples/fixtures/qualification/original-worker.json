@@ -1,0 +1,166 @@
+[
+  {
+    "operation": "extract",
+    "response": {
+      "requirements": [
+        {
+          "position": "14",
+          "component": null,
+          "property": "capacity",
+          "constraint": {
+            "kind": "numeric",
+            "operator": "at_least",
+            "value": "2",
+            "upper": null,
+            "unit": "kg"
+          },
+          "scope": "laboratory",
+          "evidence": [
+            {
+              "block_id": "tz:2",
+              "quote": "Capacity >= 2 kg"
+            }
+          ],
+          "reference": null
+        },
+        {
+          "position": "14",
+          "component": null,
+          "property": "division",
+          "constraint": {
+            "kind": "numeric",
+            "operator": "at_most",
+            "value": "0,1",
+            "upper": null,
+            "unit": "g"
+          },
+          "scope": "laboratory",
+          "evidence": [
+            {
+              "block_id": "tz:2",
+              "quote": "division <= 0,1 g"
+            }
+          ],
+          "reference": null
+        },
+        {
+          "position": "15",
+          "component": null,
+          "property": "memory",
+          "constraint": {
+            "kind": "numeric",
+            "operator": "at_least",
+            "value": "1000",
+            "upper": null,
+            "unit": "records"
+          },
+          "scope": "laboratory",
+          "evidence": [
+            {
+              "block_id": "tz:5",
+              "quote": "Memory >= 1000 records"
+            }
+          ],
+          "reference": null
+        }
+      ],
+      "unresolved": []
+    }
+  },
+  {
+    "operation": "assess",
+    "response": {
+      "action": "assess",
+      "requirement_id": "requirement-1",
+      "assessment": "justified",
+      "operation": "Weigh samples at the confirmed working load",
+      "reason": "2 kg capacity covers samples and fixture up to 1,5 kg.",
+      "evidence": [
+        {
+          "block_id": "tz:3",
+          "quote": "Task: weigh samples up to 1,5 kg, including the fixture."
+        }
+      ],
+      "allowed_case": "A scale with the permitted division boundary",
+      "alternative": null,
+      "margin": null
+    }
+  },
+  {
+    "operation": "assess",
+    "response": {
+      "action": "ask",
+      "requirement_id": "requirement-2",
+      "fact": "minimum distinguishable mass difference at working load",
+      "question": "Какую разницу масс нужно различать при рабочей нагрузке?"
+    }
+  },
+  {
+    "operation": "assess",
+    "response": {
+      "action": "technical_fact",
+      "requirement_id": "requirement-3",
+      "target": {
+        "model": "H1",
+        "parameter": "Memory",
+        "numeric": true,
+        "conditions": []
+      },
+      "query": "H1 original manufacturer memory passport"
+    }
+  },
+  {
+    "operation": "verify",
+    "response": {
+      "primary_source": true,
+      "reason": "Original H1 passport, the value is in the H1 column.",
+      "fact": {
+        "model": {
+          "block_id": "source-6a66d7b9044824d01a4b2fa7591aaec103d6001f97fdc062eca94726505338f4:1",
+          "quote": "H1"
+        },
+        "parameter": {
+          "block_id": "source-6a66d7b9044824d01a4b2fa7591aaec103d6001f97fdc062eca94726505338f4:2",
+          "quote": "Memory"
+        },
+        "value": {
+          "block_id": "source-6a66d7b9044824d01a4b2fa7591aaec103d6001f97fdc062eca94726505338f4:2",
+          "quote": "1000"
+        },
+        "unit": {
+          "block_id": "source-6a66d7b9044824d01a4b2fa7591aaec103d6001f97fdc062eca94726505338f4:2",
+          "quote": "records"
+        },
+        "conditions": []
+      }
+    }
+  },
+  {
+    "operation": "assess",
+    "response": {
+      "action": "ask",
+      "requirement_id": "requirement-3",
+      "fact": "maximum records including repetitions and reserve before export",
+      "question": "Сколько записей занимает максимальная серия с повторами и запасом до выгрузки?"
+    }
+  },
+  {
+    "operation": "assess",
+    "response": {
+      "action": "assess",
+      "requirement_id": "requirement-2",
+      "assessment": "insufficient",
+      "operation": "Weigh samples at the confirmed working load",
+      "reason": "Ответ заказчика требует различать 0,02 г; проверена разрешённая ТЗ граница шага.",
+      "evidence": [
+        {
+          "block_id": "tz:2",
+          "quote": "division <= 0,1 g"
+        }
+      ],
+      "allowed_case": "A scale with the permitted division boundary",
+      "alternative": null,
+      "margin": null
+    }
+  }
+]

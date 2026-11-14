@@ -27,6 +27,46 @@ struct Claims {
 }
 
 #[tokio::test]
+async fn worker_and_reviewer_share_a_budget_and_receive_their_own_stages() {
+    let worker = Arc::new(Mutex::new(Vec::new()));
+    let reviewer = Arc::new(Mutex::new(Vec::new()));
+    let runtime = Runtime::new(LocalModel(worker.clone()), Duration::from_secs(1))
+        .with_reviewer(LocalModel(reviewer.clone()));
+    let run = ReviewRun::new(4);
+    for (kind, instruction) in [
+        (StageKind::Claims, "extract"),
+        (StageKind::Control, "control"),
+        (StageKind::Comparison, "compare"),
+        (StageKind::Review, "verdict"),
+    ] {
+        runtime
+            .step::<Claims>(&run, &StageRequest::new(kind, instruction))
+            .await
+            .unwrap();
+    }
+    let names = |prompts: &Mutex<Vec<String>>| -> Vec<String> {
+        prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|prompt| {
+                let body: serde_json::Value = serde_json::from_str(prompt).unwrap();
+                body["instruction"].as_str().unwrap().to_owned()
+            })
+            .collect()
+    };
+    assert_eq!(names(&worker), ["extract"]);
+    assert_eq!(names(&reviewer), ["control", "compare", "verdict"]);
+    assert_eq!(run.attempts(), 4);
+    assert_eq!(
+        runtime
+            .step::<Claims>(&run, &StageRequest::new(StageKind::Review, "retry"))
+            .await,
+        Err(StepError::BudgetExhausted)
+    );
+}
+
+#[tokio::test]
 async fn serialization_failure_preserves_the_attempt_budget() {
     let prompts = Arc::new(Mutex::new(Vec::new()));
     let runtime = Runtime::new(LocalModel(prompts.clone()), Duration::from_secs(1));
@@ -71,6 +111,7 @@ async fn external_consumer_decodes_a_typed_stage() {
     assert_eq!(claims.claims, ["A claim"]);
     let prompts = prompts.lock().unwrap();
     assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].starts_with(r#"{"instruction":"Extract claims as JSON.","data":["#));
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&prompts[0]).unwrap(),
         serde_json::json!({

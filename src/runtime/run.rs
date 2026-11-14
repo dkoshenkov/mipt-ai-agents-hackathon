@@ -10,6 +10,10 @@ pub struct ReviewRun {
 }
 
 impl ReviewRun {
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
     pub fn new(limit: usize) -> Self {
         Self {
             id: format!(
@@ -25,6 +29,10 @@ impl ReviewRun {
     /// Number of attempts dispatched, including requests that failed or timed out.
     pub fn attempts(&self) -> usize {
         self.attempts.load(Ordering::Relaxed)
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.limit.saturating_sub(self.attempts())
     }
 
     pub(super) fn reserve(&self) -> Option<usize> {

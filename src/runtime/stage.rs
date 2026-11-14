@@ -10,6 +10,9 @@ use super::{ReviewRun, Runtime, grok::Model};
 pub enum StageKind {
     Claims,
     Review,
+    Control,
+    Comparison,
+    Search,
 }
 
 /// An application-defined instruction for a typed model stage.
@@ -17,6 +20,7 @@ pub struct StageRequest<'a> {
     pub kind: StageKind,
     pub instruction: &'static str,
     fields: Vec<StageField<'a>>,
+    schema: Option<schemars::Schema>,
 }
 
 struct StageField<'a> {
@@ -31,7 +35,13 @@ impl<'a> StageRequest<'a> {
             kind,
             instruction,
             fields: Vec::new(),
+            schema: None,
         }
+    }
+
+    pub fn schema(mut self, schema: schemars::Schema) -> Self {
+        self.schema = Some(schema);
+        self
     }
 
     /// Add data and every source from which it was derived.
@@ -49,7 +59,7 @@ impl<'a> StageRequest<'a> {
         self
     }
 
-    fn prepare(&self) -> Result<String, StepError> {
+    pub(super) fn prepare(&self) -> Result<String, StepError> {
         if self.fields.iter().any(|field| {
             field.sources.is_empty()
                 || field
@@ -65,11 +75,21 @@ impl<'a> StageRequest<'a> {
             let value = (field.serialize)().map_err(|_| StepError::Preparation)?;
             fields.push(json!({"name": field.name, "value": value}));
         }
-        Ok(json!({"instruction": self.instruction, "data": fields}).to_string())
+        // Struct field order puts the shared instruction before changing packet data.
+        #[derive(Serialize)]
+        struct Prompt<'a> {
+            instruction: &'a str,
+            data: Vec<Value>,
+        }
+        serde_json::to_string(&Prompt {
+            instruction: self.instruction,
+            data: fields,
+        })
+        .map_err(|_| StepError::Preparation)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum StepError {
     Preparation,
     RestrictedContext,
@@ -85,6 +105,10 @@ impl<M: Model> Runtime<M> {
         run: &ReviewRun,
         request: &StageRequest<'_>,
     ) -> Result<T, StepError> {
+        let model = match request.kind {
+            StageKind::Claims | StageKind::Search => &self.model,
+            StageKind::Review | StageKind::Control | StageKind::Comparison => self.reviewer(),
+        };
         let stage = super::logging::TypedStage::start(&run.id, request.kind);
         let prompt = match request.prepare() {
             Ok(prompt) => prompt,
@@ -98,7 +122,10 @@ impl<M: Model> Runtime<M> {
             return Err(StepError::BudgetExhausted);
         };
         stage.dispatch(attempt);
-        let result = self.request_json(&prompt).await.map_err(StepError::Model);
+        let result = self
+            .request_json_with_schema(model, &prompt, request.schema.as_ref())
+            .await
+            .map_err(StepError::Model);
         stage.finish(
             result.as_ref().map(|_| ()).map_err(|error| *error),
             Some(attempt),

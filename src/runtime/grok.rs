@@ -63,6 +63,7 @@ fn model_error(category: ErrorCategory) -> RequestError {
     )
 }
 
+#[derive(Clone)]
 pub struct Grok {
     client: OpenAI,
     model: String,
@@ -96,8 +97,8 @@ impl Grok {
     }
 
     /// Set a stable key for provider prompt caching.
-    pub fn with_prompt_cache_key(mut self, key: String) -> Self {
-        self.prompt_cache_key = Some(key);
+    pub fn with_prompt_cache_key(mut self, key: impl Into<String>) -> Self {
+        self.prompt_cache_key = Some(key.into());
         self
     }
 
@@ -191,62 +192,70 @@ impl Grok {
         if let Some(usage) = &self.usage {
             usage.lock().unwrap().push(response.usage);
         }
-        if response
-            .raw
-            .get("status")
-            .and_then(|status| status.as_str())
-            != Some("completed")
-        {
-            return Err(RequestError::new(
-                ErrorCategory::InvalidResponse,
-                "response_validation",
-                "Response status was not completed",
-            ));
-        }
-        if response.stop() != StopReason::Stop {
-            return Err(RequestError::new(
-                ErrorCategory::InvalidResponse,
-                "response_validation",
-                format!("Unexpected stop reason: {:?}", response.stop()),
-            ));
-        }
-        // Rig 0.46 keeps these client-executed Responses items opaque.
-        let client_action = response.raw["output"].as_array().is_some_and(|output| {
-            output.iter().any(|item| {
-                matches!(
-                    item["type"].as_str(),
-                    Some(
-                        "computer_call"
-                            | "local_shell_call"
-                            | "shell_call"
-                            | "apply_patch_call"
-                            | "mcp_approval_request"
-                    )
-                )
-            })
-        });
-        let refusal = response.raw["output"].as_array().is_some_and(|output| {
-            output.iter().any(|item| {
-                item["type"] == "message"
-                    && item["content"]
-                        .as_array()
-                        .is_some_and(|content| content.iter().any(|part| part["type"] == "refusal"))
-            })
-        });
-        if response.tool_calls().next().is_some() || client_action || refusal {
-            return Err(RequestError::new(
-                ErrorCategory::InvalidResponse,
-                "response_validation",
-                format!(
-                    "Rejected response: tool_calls={}, client_action={client_action}, refusal={refusal}",
-                    response.tool_calls().count()
-                ),
-            ));
-        }
+        validate_response(
+            &response.raw,
+            response.stop(),
+            response.tool_calls().count(),
+        )?;
         response_text(response.text()).map_err(|category| {
             RequestError::new(category, "response_text", "Response contains no text")
         })
     }
+}
+
+fn validate_response(
+    raw: &serde_json::Value,
+    stop: StopReason,
+    tool_calls: usize,
+) -> Result<(), RequestError> {
+    if raw.get("status").and_then(|status| status.as_str()) != Some("completed") {
+        return Err(RequestError::new(
+            ErrorCategory::InvalidResponse,
+            "response_validation",
+            "Response status was not completed",
+        ));
+    }
+    if stop != StopReason::Stop {
+        return Err(RequestError::new(
+            ErrorCategory::InvalidResponse,
+            "response_validation",
+            format!("Unexpected stop reason: {:?}", stop),
+        ));
+    }
+    // Rig 0.46 keeps these client-executed Responses items opaque.
+    let client_action = raw["output"].as_array().is_some_and(|output| {
+        output.iter().any(|item| {
+            matches!(
+                item["type"].as_str(),
+                Some(
+                    "computer_call"
+                        | "local_shell_call"
+                        | "shell_call"
+                        | "apply_patch_call"
+                        | "mcp_approval_request"
+                )
+            )
+        })
+    });
+    let refusal = raw["output"].as_array().is_some_and(|output| {
+        output.iter().any(|item| {
+            item["type"] == "message"
+                && item["content"]
+                    .as_array()
+                    .is_some_and(|content| content.iter().any(|part| part["type"] == "refusal"))
+        })
+    });
+    if tool_calls > 0 || client_action || refusal {
+        return Err(RequestError::new(
+            ErrorCategory::InvalidResponse,
+            "response_validation",
+            format!(
+                "Rejected response: tool_calls={}, client_action={client_action}, refusal={refusal}",
+                tool_calls
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn provider_diagnostic(error: &ProviderError) -> RequestError {
@@ -269,6 +278,79 @@ fn response_text(text: String) -> Result<String, ErrorCategory> {
         Err(ErrorCategory::InvalidResponse)
     } else {
         Ok(text)
+    }
+}
+
+impl super::search::SearchModel for Grok {
+    async fn search(
+        &self,
+        prompt: &str,
+        max_turns: usize,
+    ) -> Result<super::search::SearchResult, ErrorCategory> {
+        let response = self
+            .client
+            .completion(&self.model)
+            .call(
+                CompletionRequest::new(prompt).additional_params(serde_json::json!({
+                    "tools": [{"type": "web_search"}], "max_turns": max_turns
+                })),
+            )
+            .await
+            .map_err(|error| classify_error(&error))?;
+        if let Some(usage) = &self.usage {
+            usage.lock().unwrap().push(response.usage);
+        }
+        validate_response(
+            &response.raw,
+            response.stop(),
+            response.tool_calls().count(),
+        )
+        .map_err(|error| error.category)?;
+        let text = response_text(response.text())?;
+        let mut result = super::search::SearchResult {
+            text,
+            tool_usage: response.raw["server_side_tool_usage"].clone(),
+            ..Default::default()
+        };
+        if let Some(output) = response.raw["output"].as_array() {
+            for item in output {
+                if let Some(content) = item["content"].as_array() {
+                    for part in content {
+                        if let Some(annotations) = part["annotations"].as_array() {
+                            for citation in
+                                annotations.iter().filter(|a| a["type"] == "url_citation")
+                            {
+                                if let Some(url) = citation["url"].as_str() {
+                                    result.citations.push(super::search::SearchCitation {
+                                        url: url.into(),
+                                        title: citation["title"].as_str().unwrap_or("").into(),
+                                        start: citation["start_index"].as_u64().map(|v| v as usize),
+                                        end: citation["end_index"].as_u64().map(|v| v as usize),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(sources) = item["action"]["sources"].as_array() {
+                    for source in sources {
+                        if let Some(url) = source["url"].as_str() {
+                            result.sources.push(url.into());
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(sources) = response.raw["citations"].as_array() {
+            for source in sources {
+                if let Some(url) = source.as_str().or_else(|| source["url"].as_str()) {
+                    result.sources.push(url.into());
+                }
+            }
+        }
+        result.sources.sort();
+        result.sources.dedup();
+        Ok(result)
     }
 }
 
@@ -356,6 +438,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_key_preserves_structured_payload_and_clone_shares_usage() {
+        let mut response = completed(vec![message("{}")]);
+        response["usage"] = serde_json::json!({
+            "input_tokens": 120, "output_tokens": 30, "total_tokens": 150,
+            "input_tokens_details": {"cached_tokens": 20}
+        });
+        let http = RecordingHttpClient::new(response.to_string());
+        let usage = Arc::new(Mutex::new(Vec::new()));
+        let grok = Grok {
+            client: OpenAIConfig::with_key(&xai::DIALECT, "test-key").connect(http.clone()),
+            model: "grok-test".into(),
+            usage: None,
+            prompt_cache_key: None,
+        }
+        .with_usage_recording(usage.clone());
+        let schema: schemars::Schema = serde_json::from_value(serde_json::json!({
+            "title": "test", "type": "object", "properties": {},
+            "required": [], "additionalProperties": false
+        }))
+        .unwrap();
+        let prompt = "common instruction\npacket one";
+        grok.complete_structured(prompt, &schema).await.unwrap();
+        grok.clone()
+            .with_prompt_cache_key("source-sha")
+            .complete_structured(prompt, &schema)
+            .await
+            .unwrap();
+        let requests = http.requests();
+        let plain: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let mut cached: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert!(plain.get("prompt_cache_key").is_none());
+        assert_eq!(
+            cached.as_object_mut().unwrap().remove("prompt_cache_key"),
+            Some("source-sha".into())
+        );
+        assert_eq!(cached, plain);
+        assert_eq!(usage.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn sends_checks_as_two_user_messages_without_parsing_document_text() {
         use crate::{
             core::{Document, Visibility},
@@ -432,7 +554,7 @@ mod tests {
             usage: None,
             prompt_cache_key: None,
         }
-        .with_prompt_cache_key("document-hash".into());
+        .with_prompt_cache_key("document-hash");
         assert_eq!(grok.complete("hello").await, Ok("[]".into()));
         let body: serde_json::Value = serde_json::from_slice(&http.requests()[0].body).unwrap();
         assert_eq!(body["prompt_cache_key"], "document-hash");
@@ -551,6 +673,11 @@ mod tests {
             assert_eq!(requests[0].headers["authorization"], "Bearer test-key");
             let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
             assert_eq!(body["model"], "grok-test");
+            assert!(
+                body["tools"]
+                    .as_array()
+                    .is_none_or(|tools| tools.is_empty())
+            );
             assert!(body.to_string().contains("without Markdown fences"));
             let user = body["input"]
                 .as_array()
@@ -575,5 +702,105 @@ mod tests {
             classify_error(&ProviderError::Response("secret body".into())),
             ErrorCategory::InvalidResponse
         );
+    }
+    #[tokio::test]
+    async fn search_wire_keeps_citations_and_rejects_incomplete_and_client_actions() {
+        use crate::runtime::search::SearchModel;
+        use rig_core::http_client::{
+            self, Bytes, HttpClientExt, LazyBody, MultipartForm, Request, Response,
+            StreamingResponse,
+        };
+        #[derive(Clone)]
+        struct PostOnly(RecordingHttpClient);
+        impl HttpClientExt for PostOnly {
+            fn send<T, U>(
+                &self,
+                request: Request<T>,
+            ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + Send + 'static
+            where
+                T: Into<Bytes> + Send,
+                U: From<Bytes> + Send + 'static,
+            {
+                assert_eq!(request.method(), http_client::Method::POST);
+                self.0.send(request)
+            }
+            fn send_multipart<U>(
+                &self,
+                request: Request<MultipartForm>,
+            ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + Send + 'static
+            where
+                U: From<Bytes> + Send + 'static,
+            {
+                self.0.send_multipart(request)
+            }
+            fn send_streaming<T>(
+                &self,
+                request: Request<T>,
+            ) -> impl Future<Output = http_client::Result<StreamingResponse>> + Send
+            where
+                T: Into<Bytes> + Send,
+            {
+                self.0.send_streaming(request)
+            }
+        }
+        let mut text = message("A has 50 MHz");
+        text["content"][0]["annotations"] = serde_json::json!([{
+            "type":"url_citation", "url":"https://maker.example/passport", "title":"Passport", "start_index":0,"end_index":12
+        }]);
+        for mode in ["completed", "incomplete", "approval", "sources_only"] {
+            let mut response = completed(vec![text.clone()]);
+            if mode == "incomplete" {
+                response["status"] = "incomplete".into();
+            }
+            if mode == "approval" {
+                response["output"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({"type":"mcp_approval_request","id":"approval"}));
+            }
+            if mode == "sources_only" {
+                response["output"][0]["content"][0]["annotations"] = serde_json::json!([]);
+            }
+            response["citations"] = serde_json::json!(["https://maker.example/other"]);
+            response["server_side_tool_usage"] =
+                serde_json::json!({"SERVER_SIDE_TOOL_WEB_SEARCH":2});
+            let http = RecordingHttpClient::new(response.to_string());
+            let grok = Grok {
+                client: OpenAIConfig::with_key(&xai::DIALECT, "test-key")
+                    .connect(PostOnly(http.clone())),
+                model: "grok-test".into(),
+                usage: None,
+                prompt_cache_key: None,
+            };
+            let result = grok.search("lookup", 3).await;
+            if matches!(mode, "incomplete" | "approval") {
+                assert_eq!(result.err(), Some(ErrorCategory::InvalidResponse));
+            } else {
+                let result = result.unwrap();
+                assert_eq!(result.sources, ["https://maker.example/other"]);
+                assert_eq!(result.citations.len(), usize::from(mode == "completed"));
+                assert_eq!(result.tool_usage["SERVER_SIDE_TOOL_WEB_SEARCH"], 2);
+            }
+            let requests = http.requests();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].uri, "https://api.x.ai/v1/responses");
+            let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+            assert_eq!(body["tools"][0]["type"], "web_search");
+            assert_eq!(body["max_turns"], 3);
+        }
+        let http =
+            RecordingHttpClient::with_error(StatusCode::TOO_MANY_REQUESTS, "secret response");
+        let grok = Grok {
+            client: OpenAIConfig::with_key(&xai::DIALECT, "test-key")
+                .connect(PostOnly(http.clone())),
+            model: "grok-test".into(),
+            usage: None,
+            prompt_cache_key: None,
+        };
+        assert_eq!(
+            grok.search("lookup", 2).await.err(),
+            Some(ErrorCategory::RateLimited)
+        );
+        assert_eq!(http.requests().len(), 1);
     }
 }

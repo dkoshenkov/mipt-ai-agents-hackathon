@@ -2,6 +2,7 @@ pub mod grok;
 pub mod logging;
 mod run;
 pub mod scenario;
+pub mod search;
 mod stage;
 
 pub use run::ReviewRun;

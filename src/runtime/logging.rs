@@ -55,6 +55,7 @@ impl<'a> TypedStage<'a> {
         init();
         let (stage, model_role) = match kind {
             StageKind::Claims => ("claims", "worker"),
+            StageKind::Search => ("search", "worker"),
             StageKind::Review => ("review", "reviewer"),
             StageKind::Control => ("control", "reviewer"),
             StageKind::Comparison => ("comparison", "reviewer"),

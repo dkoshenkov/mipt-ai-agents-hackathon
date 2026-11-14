@@ -28,10 +28,12 @@ pub trait Model: Send + Sync {
     }
 }
 
+#[derive(Clone)]
 pub struct Grok {
     client: OpenAI,
     model: String,
     usage: Option<Arc<Mutex<Vec<Usage>>>>,
+    prompt_cache_key: Option<String>,
 }
 
 impl Grok {
@@ -55,7 +57,14 @@ impl Grok {
             client: xai::new(api_key),
             model,
             usage: None,
+            prompt_cache_key: None,
         }
+    }
+
+    /// Route related requests to the same xAI cache when possible.
+    pub fn with_prompt_cache_key(mut self, key: impl Into<String>) -> Self {
+        self.prompt_cache_key = Some(key.into());
+        self
     }
 
     /// Record usage from received responses when explicitly requested.
@@ -99,6 +108,9 @@ impl Grok {
         let mut request = CompletionRequest::new(prompt).preamble(
             "Return exactly the JSON value requested, without Markdown fences or commentary.",
         );
+        if let Some(key) = &self.prompt_cache_key {
+            request = request.additional_params(serde_json::json!({"prompt_cache_key": key}));
+        }
         if let Some(schema) = schema {
             request = request.output_schema(schema.clone());
         }
@@ -290,6 +302,7 @@ mod tests {
             client: OpenAIConfig::with_key(&xai::DIALECT, "test-key").connect(http.clone()),
             model: "grok-test".into(),
             usage: None,
+            prompt_cache_key: None,
         };
         grok.complete("hello").await
     }
@@ -301,6 +314,7 @@ mod tests {
             client: OpenAIConfig::with_key(&xai::DIALECT, "test-key").connect(http.clone()),
             model: "grok-test".into(),
             usage: None,
+            prompt_cache_key: None,
         };
         let schema: schemars::Schema = serde_json::from_value(serde_json::json!({
             "title": "test", "type": "object", "properties": {},
@@ -322,6 +336,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_key_preserves_structured_payload_and_clone_shares_usage() {
+        let mut response = completed(vec![message("{}")]);
+        response["usage"] = serde_json::json!({
+            "input_tokens": 120, "output_tokens": 30, "total_tokens": 150,
+            "input_tokens_details": {"cached_tokens": 20}
+        });
+        let http = RecordingHttpClient::new(response.to_string());
+        let usage = Arc::new(Mutex::new(Vec::new()));
+        let grok = Grok {
+            client: OpenAIConfig::with_key(&xai::DIALECT, "test-key").connect(http.clone()),
+            model: "grok-test".into(),
+            usage: None,
+            prompt_cache_key: None,
+        }
+        .with_usage_recording(usage.clone());
+        let schema: schemars::Schema = serde_json::from_value(serde_json::json!({
+            "title": "test", "type": "object", "properties": {},
+            "required": [], "additionalProperties": false
+        }))
+        .unwrap();
+        let prompt = "common instruction\npacket one";
+        grok.complete_structured(prompt, &schema).await.unwrap();
+        grok.clone()
+            .with_prompt_cache_key("source-sha")
+            .complete_structured(prompt, &schema)
+            .await
+            .unwrap();
+        let requests = http.requests();
+        let plain: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let mut cached: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert!(plain.get("prompt_cache_key").is_none());
+        assert_eq!(
+            cached.as_object_mut().unwrap().remove("prompt_cache_key"),
+            Some("source-sha".into())
+        );
+        assert_eq!(cached, plain);
+        assert_eq!(usage.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn records_usage_even_when_response_is_rejected() {
         let mut response = completed(vec![message("answer")]);
         response["status"] = "incomplete".into();
@@ -335,6 +389,7 @@ mod tests {
             client: OpenAIConfig::with_key(&xai::DIALECT, "test-key").connect(http),
             model: "grok-test".into(),
             usage: None,
+            prompt_cache_key: None,
         }
         .with_usage_recording(usage.clone());
         assert_eq!(
@@ -531,6 +586,7 @@ mod tests {
                     .connect(PostOnly(http.clone())),
                 model: "grok-test".into(),
                 usage: None,
+                prompt_cache_key: None,
             };
             let result = grok.search("lookup", 3).await;
             if matches!(mode, "incomplete" | "approval") {
@@ -555,6 +611,7 @@ mod tests {
                 .connect(PostOnly(http.clone())),
             model: "grok-test".into(),
             usage: None,
+            prompt_cache_key: None,
         };
         assert_eq!(
             grok.search("lookup", 2).await.err(),

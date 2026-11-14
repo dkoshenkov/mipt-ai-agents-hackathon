@@ -111,6 +111,7 @@ async fn external_consumer_decodes_a_typed_stage() {
     assert_eq!(claims.claims, ["A claim"]);
     let prompts = prompts.lock().unwrap();
     assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].starts_with(r#"{"instruction":"Extract claims as JSON.","data":["#));
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&prompts[0]).unwrap(),
         serde_json::json!({
